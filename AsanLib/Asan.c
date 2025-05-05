@@ -26,6 +26,22 @@ UINT64 mShadowOffset = 0x5000000;
 #define MEM_TO_SHADOW(mem) (((mem) >> SHADOW_SCALE) + (SHADOW_OFFSET))
 #define SHADOW_GRANULARITY (1ULL << SHADOW_SCALE)
 
+#define __cpuid_extended1(value, arg0)                          \
+  unsigned int _a __attribute__((unused)) = 0;                  \
+  unsigned int _b __attribute__((unused)) = 0;                  \
+  unsigned int _c __attribute__((unused)) = 0;                  \
+  unsigned int _d __attribute__((unused)) = 0;                  \
+  __asm__ __volatile__("cpuid\n\t"                              \
+                       : "=a"(_a), "=b"(_b), "=c"(_c), "=d"(_d) \
+                       : "a"(value), "D"(arg0));
+
+// #define HARNESS_ASSERT()
+#define HARNESS_ASSERT()                                   \
+  do {                                                     \
+    unsigned int value = (0x0005U << 0x10U) | 0x4711U; \
+    __cpuid_extended1(value, 0x0000U);               \
+  } while (0);
+
 #define ASAN_ASSERT(Expression)   \
 do {                            \
   if (!(Expression)) {          \
@@ -289,16 +305,18 @@ void __asan_report_store_n_noabort(UINTN addr, UINTN size)
 
 #define SANITIZER_CALLSTACK_DUMP(fun_name)                                \
 {                                                                         \
-  CHAR8 NumStr[19];                                                       \
   SerialOutput2 ("ASAN MEMORY ACCESS check fail! ");                      \
   gSerialOutputSwitch = 1;                                                \
   SerialOutput2 (fun_name);                                               \
   SerialOutput (" is called:\n");                                         \
   SerialOutput ("Return IP address is ");                                 \
-  Num2Str64bit ((UINTN)__builtin_return_address(0),NumStr);       \
-  SerialOutput (NumStr);                                                  \
   SerialOutput ("\n");                                                    \
+  HARNESS_ASSERT();                                                       \
 }
+    // CHAR8 NumStr[19];                                                       \
+  // Num2Str64bit ((UINTN)__builtin_return_address(0),NumStr);       \
+  // SerialOutput (NumStr);                                                  \
+
   // Num2Str64bit ((UINTN)__builtin_return_address(1),NumStr);       \
   // SerialOutput (NumStr);                                                  \
   // SerialOutput ("\n");                                                    \
@@ -1309,11 +1327,11 @@ void __asan_init() {
 }
 
 void __asan_version_mismatch_check_v8() {
-  SerialOutput ("__asan_version_mismatch_check_v8 is called\n");
+  // SerialOutput ("__asan_version_mismatch_check_v8 is called\n");
 }
 
 void __asan_version_mismatch_check_v6() {
-  SerialOutput ("__asan_version_mismatch_check_v6 is called\n");
+  // SerialOutput ("__asan_version_mismatch_check_v6 is called\n");
 }
 
 VOID *
@@ -1391,6 +1409,18 @@ const char *TypeCheckKinds[] = {
     "upcast of", "cast to virtual base of", "_Nonnull binding to"
 };
 
+void __ubsan_handle_invalid_builtin(struct TypeMismatchData *Data, UINTN Pointer) {
+  CHAR8 NumStr[19];
+  SerialOutput (Data->Loc.file_name);
+  SerialOutput (", line:");
+  Num2Str16bit (Data->Loc.line, NumStr);
+  SerialOutput (NumStr);
+  SerialOutput (", column:");
+  Num2Str16bit (Data->Loc.column, NumStr);
+  SerialOutput (NumStr);
+  SerialOutput (" ErrorType = ");
+  SerialOutput ("InvalidBuiltin\n");
+}
 
 void __ubsan_handle_type_mismatch(struct TypeMismatchData *Data, UINTN Pointer) {
   CHAR8 NumStr[19];
@@ -1426,7 +1456,7 @@ void __ubsan_handle_type_mismatch(struct TypeMismatchData *Data, UINTN Pointer) 
     SerialOutput ("InsufficientObjectSize\n");
   }
 
-  SANITIZER_CALLSTACK_DUMP("__ubsan_handle_type_mismatch");
+  // SANITIZER_CALLSTACK_DUMP("__ubsan_handle_type_mismatch");
 }
 
 void __ubsan_handle_type_mismatch_v1(struct TypeMismatchData *Data, UINTN Pointer) {
@@ -1463,7 +1493,7 @@ void __ubsan_handle_type_mismatch_v1(struct TypeMismatchData *Data, UINTN Pointe
     SerialOutput ("InsufficientObjectSize\n");
   }
 
-  SANITIZER_CALLSTACK_DUMP("__ubsan_handle_type_mismatch_v1");
+  // SANITIZER_CALLSTACK_DUMP("__ubsan_handle_type_mismatch_v1");
 }
 
 void __ubsan_handle_type_mismatch_v1_abort(UINTN *Data, UINTN Pointer) {

@@ -494,6 +494,9 @@ const char *TypeCheckKinds[] = {
     "upcast of", "cast to virtual base of", "_Nonnull binding to"
 };
 
+void __ubsan_handle_invalid_builtin(struct TypeMismatchData *Data, UINTN Pointer) {
+
+}
 
 void __ubsan_handle_type_mismatch(struct TypeMismatchData *Data, UINTN Pointer) {
 

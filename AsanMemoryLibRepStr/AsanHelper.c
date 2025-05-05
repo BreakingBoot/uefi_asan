@@ -329,8 +329,8 @@ AsanInternalMemCopyMem (
   IN UINTN  Line
   )
 {
-  asan_check_memory((UINTN)SourceBuffer, Length, FALSE, GET_CURRENT_PC(), File, Line);
-  asan_check_memory((UINTN)DestinationBuffer, Length, TRUE, GET_CURRENT_PC(), File, Line);
+  ASAN_ASSERT(asan_check_memory((UINTN)SourceBuffer, Length, FALSE, GET_CURRENT_PC(), File, Line));
+  ASAN_ASSERT(asan_check_memory((UINTN)DestinationBuffer, Length, TRUE, GET_CURRENT_PC(), File, Line));
   return InternalMemCopyMem(DestinationBuffer, SourceBuffer, Length);
 }
 
@@ -344,6 +344,6 @@ AsanInternalMemSetMem (
   IN UINTN  Line 
   )
 {
-  asan_check_memory((UINTN)Buffer, Length, TRUE, GET_CURRENT_PC(), File, Line);
+  ASAN_ASSERT(asan_check_memory((UINTN)Buffer, Length, TRUE, GET_CURRENT_PC(), File, Line));
   return InternalMemSetMem(Buffer, Length, Value);
 }
