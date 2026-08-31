@@ -96,6 +96,39 @@ static BOOLEAN AdjacentShadowValuesAreFullyPoisoned(u8 *s) {
   return s[-1] > 127 && s[1] > 127;
 } */
 
+// Set by the generated harness right after HARNESS_START. While it is FALSE the
+// sanitizer only logs, which is what a plain boot wants: this firmware emits ~630
+// UBSan reports before the harness ever runs, and escalating those would kill every
+// boot. While it is TRUE a report also tells the fuzzer the iteration is a solution.
+BOOLEAN mAsanFuzzingActive = FALSE;
+
+VOID
+AsanSetFuzzingActive (
+  IN BOOLEAN Active
+  )
+{
+  mAsanFuzzingActive = Active;
+}
+
+// Report the current iteration to TSFFS as a solution. This is the tsffs.h
+// HARNESS_ASSERT sequence written out by hand so the sanitizer does not have to
+// carry a fuzzer header: cpuid with eax = (N_STOP_ASSERT << 16) | MAGIC.
+// Without it a detected error is printed and then executed, and TSFFS -- which only
+// scores exceptions 12/13/14 -- never sees it.
+void AsanSignalSolution (VOID)
+{
+  unsigned int _a = 0, _b = 0, _c = 0, _d = 0;
+  unsigned int value = (0x0005U << 0x10U) | 0x4711U;
+
+  if (!mAsanFuzzingActive) {
+    return ;
+  }
+
+  __asm__ __volatile__ ("cpuid\n\t"
+                        : "=a"(_a), "=b"(_b), "=c"(_c), "=d"(_d)
+                        : "a"(value), "D"(0));
+}
+
 void ReportGenericError(UINTN addr, BOOLEAN is_write, UINTN access_size) {
 /*
   // Determine the error type.
@@ -205,6 +238,7 @@ void ReportGenericError(UINTN addr, BOOLEAN is_write, UINTN access_size) {
     // PrintContainerOverflowHint();
   // ReportErrorSummary(bug_descr, &stack);
   // PrintShadowMemoryForAddress(addr);
+  AsanSignalSolution ();
 }
 
 
@@ -287,6 +321,10 @@ void __asan_report_store_n_noabort(UINTN addr, UINTN size)
 }
 
 
+// defined below; every sanitizer report routes through here so a finding during
+// fuzzing also ends the iteration as a solution
+void AsanSignalSolution (VOID);
+
 #define SANITIZER_CALLSTACK_DUMP(fun_name)                                \
 {                                                                         \
   CHAR8 NumStr[19];                                                       \
@@ -298,6 +336,7 @@ void __asan_report_store_n_noabort(UINTN addr, UINTN size)
   Num2Str64bit ((UINTN)__builtin_return_address(0),NumStr);       \
   SerialOutput (NumStr);                                                  \
   SerialOutput ("\n");                                                    \
+  AsanSignalSolution ();                                                  \
 }
   // Num2Str64bit ((UINTN)__builtin_return_address(1),NumStr);       \
   // SerialOutput (NumStr);                                                  \
@@ -358,6 +397,7 @@ void __asan_load##size(UINTN addr)          \
               Num2Str64bit ((UINTN)__builtin_return_address(4),NumStr);       \
               SerialOutput (NumStr);                                                  \
               SerialOutput ("\n");                                                    \
+              AsanSignalSolution ();                                      \
               Num2Str64bit ((UINTN)__builtin_return_address(5),NumStr);       \
               SerialOutput (NumStr);                                                  \
               SerialOutput ("\n");                                                    \
@@ -425,6 +465,7 @@ void __asan_store##size(UINTN addr)         \
               Num2Str64bit ((UINTN)__builtin_return_address(4),NumStr);       \
               SerialOutput (NumStr);                                                  \
               SerialOutput ("\n");                                                    \
+              AsanSignalSolution ();                                      \
               Num2Str64bit ((UINTN)__builtin_return_address(5),NumStr);       \
               SerialOutput (NumStr);                                                  \
               SerialOutput ("\n");                                                    \
@@ -490,6 +531,7 @@ void __asan_load##size##_noabort(UINTN addr)  \
               Num2Str64bit ((UINTN)__builtin_return_address(4),NumStr);       \
               SerialOutput (NumStr);                                                  \
               SerialOutput ("\n");                                                    \
+              AsanSignalSolution ();                                      \
               Num2Str64bit ((UINTN)__builtin_return_address(5),NumStr);       \
               SerialOutput (NumStr);                                                  \
               SerialOutput ("\n");                                                    \
@@ -554,6 +596,7 @@ void __asan_store##size##_noabort(UINTN addr)   \
               Num2Str64bit ((UINTN)__builtin_return_address(4),NumStr);       \
               SerialOutput (NumStr);                                                  \
               SerialOutput ("\n");                                                    \
+              AsanSignalSolution ();                                      \
               Num2Str64bit ((UINTN)__builtin_return_address(5),NumStr);       \
               SerialOutput (NumStr);                                                  \
               SerialOutput ("\n");                                                    \
@@ -687,6 +730,7 @@ void __asan_loadN_noabort(UINTN addr, UINTN size)
 
   if (__asan_region_is_poisoned(addr, size)) {
     SerialOutput2 ("__asan_loadN_noabort ASAN MEMORY ACCESS check fail! ");
+    AsanSignalSolution ();
     gSerialOutputSwitch = 1;
     UINTN sp = MEM_TO_SHADOW(addr);
     if(sp < mAsanShadowMemoryStart || mAsanShadowMemoryEnd < sp) {
@@ -737,6 +781,7 @@ void __asan_storeN_noabort(UINTN addr, UINTN size)
   //SerialOutput ("__asan_storeN_noabort is called\n");
   if (__asan_region_is_poisoned(addr, size)) {
     SerialOutput2 ("__asan_storeN_noabort ASAN MEMORY ACCESS check fail! ");
+    AsanSignalSolution ();
     gSerialOutputSwitch = 1;
     UINTN sp = MEM_TO_SHADOW(addr);
     if(sp < mAsanShadowMemoryStart || mAsanShadowMemoryEnd < sp) {
@@ -787,6 +832,7 @@ void __asan_loadN(UINTN addr, UINTN size)
   //SerialOutput ("__asan_loadN is called\n");
   if (__asan_region_is_poisoned(addr, size)) {
     SerialOutput2 ("__asan_loadN ASAN MEMORY ACCESS check fail! ");
+    AsanSignalSolution ();
     gSerialOutputSwitch = 1;
     UINTN sp = MEM_TO_SHADOW(addr);
     if(sp < mAsanShadowMemoryStart || mAsanShadowMemoryEnd < sp) {
@@ -837,6 +883,7 @@ void __asan_storeN(UINTN addr, UINTN size)
 
   if (__asan_region_is_poisoned(addr, size)) {
     SerialOutput2 ("__asan_storeN ASAN MEMORY ACCESS check fail! ");
+    AsanSignalSolution ();
     gSerialOutputSwitch = 1;
     UINTN sp = MEM_TO_SHADOW(addr);
     if(sp < mAsanShadowMemoryStart || mAsanShadowMemoryEnd < sp) {
@@ -881,7 +928,13 @@ void __asan_storeN(UINTN addr, UINTN size)
 //\llvm\projects\compiler-rt\lib\asan\asan_fake_stack.cc
 // ---------------------- Interface ---------------- {{{1
 int __asan_option_detect_stack_use_after_return = 0;
-UINTN __asan_shadow_memory_dynamic_address = 0x10000000;
+// -asan-force-dynamic-shadow makes every instrumented function load this in its entry
+// block, and with -asan-stack on the prologue STORES frame redzones through it inline,
+// with no asan_inited guard. SetupAsanShadowMemory() only assigns it from
+// AsanLibConstructor, which for DxeCore runs long after instrumented code has already
+// executed, so the initialiser has to be the real shadow base or those prologues
+// scribble on DRAM at 0x10000000 + (RSP >> 3). Kept in sync with SimicsPei/MemDetect.c.
+UINTN __asan_shadow_memory_dynamic_address = 0x5000000;
 
 UINTN 
 EFIAPI
@@ -1089,10 +1142,20 @@ PoisonPool(
 
   ASAN_ASSERT(Size != 0);
 
+  // Shadow encoding: 0 means all 8 bytes addressable, 1..7 means that many LEADING
+  // bytes addressable and the rest poisoned, a magic means the whole granule poisoned.
+  // 8 is not a legal value -- (addr & 7) can never reach it, so it reads as fully
+  // addressable, which is what an already-aligned Addr used to write here.
   aligned_addr = RoundUpTo(Addr, SHADOW_GRANULARITY);
+  if (aligned_addr != Addr) {
+    UINT8 *shadow = (UINT8*)(UINTN)MEM_TO_SHADOW(Addr);
+    *shadow = (UINT8)(Addr & (SHADOW_GRANULARITY - 1));
+    if (aligned_addr >= (Addr + Size)) {
+      // the whole range lives inside one granule
+      return ;
+    }
+  }
   Size -= (aligned_addr - Addr);
-  UINT8 *shadow = (UINT8*)(UINTN)MEM_TO_SHADOW(Addr);
-  *shadow = (UINT8)(SHADOW_GRANULARITY - (aligned_addr - Addr));
 
   // SerialOutput ("aligned_addr=");
   // Num2Str64bit ( aligned_addr , NumStr);
@@ -1112,8 +1175,9 @@ PoisonPool(
   if (aligned_End < (aligned_addr + Size -1)) {
     ASAN_ASSERT ((aligned_addr + Size -1 - aligned_End) < SHADOW_GRANULARITY);
     UINT8 *shadow = (UINT8*)(UINTN)MEM_TO_SHADOW(aligned_addr + Size - 1);
-    // first size-i bytes are addressable
-    *shadow = (UINT8)(aligned_addr + Size -1 - aligned_End);
+    // poison the trailing granule whole. writing the byte count here means "that many
+    // leading bytes addressable", which left the last 7 bytes of every redzone live
+    *shadow = value;
   }
 
 }
@@ -1134,9 +1198,14 @@ UnpoisonPool(
   ASAN_ASSERT(Size != 0);
 
   aligned_addr = RoundUpTo(Addr, SHADOW_GRANULARITY);
+  if (aligned_addr != Addr) {
+    UINT8 *shadow = (UINT8*)(UINTN)MEM_TO_SHADOW(Addr);
+    *shadow = 0;
+    if (aligned_addr >= (Addr + Size)) {
+      return ;
+    }
+  }
   Size -= (aligned_addr - Addr);
-  UINT8 *shadow = (UINT8*)(UINTN)MEM_TO_SHADOW(Addr);
-  *shadow = 0;
 
   ASAN_ASSERT(AddrIsAlignedByGranularity(aligned_addr));
 
@@ -1152,6 +1221,28 @@ UnpoisonPool(
 }
 
 
+// the shadow only covers system memory below 4GB, so a range outside it maps to a
+// shadow address outside the reservation and writing it would corrupt live DRAM
+BOOLEAN
+AsanPageRangeHasShadow (
+  IN const UINT64 Start,
+  IN const UINTN  PageNum
+  )
+{
+  UINT64  ShadowBegin;
+  UINT64  ShadowEnd;
+
+  if (PageNum == 0) {
+    return FALSE;
+  }
+
+  ShadowBegin = MEM_TO_SHADOW (Start);
+  ShadowEnd   = MEM_TO_SHADOW (Start + EFI_PAGES_TO_SIZE (PageNum) - 1);
+
+  return (BOOLEAN)((ShadowBegin >= mAsanShadowMemoryStart) &&
+                   (ShadowEnd   <= mAsanShadowMemoryEnd));
+}
+
 void PoisonPages (
   IN const UINT64 Start,
   IN const UINTN  PageNum,
@@ -1163,7 +1254,13 @@ void PoisonPages (
     return ;
   }
 
-  FastPoisonShadow(Start, EFI_PAGES_TO_SIZE(PageNum), kAsanInternalHeapMagic);
+  if (!AsanPageRangeHasShadow (Start, PageNum)) {
+    return ;
+  }
+
+  // was hardcoding kAsanInternalHeapMagic and ignoring Value, which made this
+  // function useless to any caller
+  FastPoisonShadow(Start, EFI_PAGES_TO_SIZE(PageNum), Value);
 }
 
 void UnpoisonPages (
@@ -1173,6 +1270,10 @@ void UnpoisonPages (
 {
   //SerialOutput ("UnpoisonPages begin\n");
   if (asan_is_deactivated || !asan_inited){
+    return ;
+  }
+
+  if (!AsanPageRangeHasShadow (Start, PageNum)) {
     return ;
   }
 
@@ -1308,12 +1409,14 @@ void __asan_init() {
 
 }
 
+// Deliberately empty. This symbol exists so a compiler/runtime version mismatch
+// fails at link time; printing here costs one UART write per instrumented module.
 void __asan_version_mismatch_check_v8() {
-  SerialOutput ("__asan_version_mismatch_check_v8 is called\n");
 }
 
+// Deliberately empty. This symbol exists so a compiler/runtime version mismatch
+// fails at link time; printing here costs one UART write per instrumented module.
 void __asan_version_mismatch_check_v6() {
-  SerialOutput ("__asan_version_mismatch_check_v6 is called\n");
 }
 
 VOID *

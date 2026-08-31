@@ -368,6 +368,13 @@ UnpoisonPool(
 }
 
 
+VOID
+AsanSetFuzzingActive (
+  IN BOOLEAN Active
+  )
+{
+}
+
 void PoisonPages (
   IN const UINT64 Start,
   IN const UINTN  PageNum,

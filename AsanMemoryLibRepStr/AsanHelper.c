@@ -52,6 +52,9 @@ do {                            \
 } while (FALSE)
 
 
+// implemented in AsanLib, which is linked into every module that gets this library
+extern void AsanSignalSolution (VOID);
+
 UINT64 mAsanShadowMemoryStart_mem = 0x5000000;
 UINT64 mAsanShadowMemorySize_mem  = 0x1C000000;
 UINT64 mAsanShadowMemoryEnd_mem   = 0x21000000;
@@ -86,37 +89,134 @@ static const UINTN kRetiredStackFrameMagic = 0x45E0360E;
 
 
 
-static inline UINTN get_poisoned_shadow_address(UINTN addr,
-                                                        UINTN size) {
-  UINTN addr_shadow_start = MEM_TO_SHADOW(addr);
-  UINTN addr_shadow_end = MEM_TO_SHADOW(addr + size - 1) + 1;
-  UINTN non_zero_shadow_addr = 0;
+#define ASAN_ROUND_UP(x, b)    ((((UINTN)(x)) + ((UINTN)(b)) - 1) & ~(((UINTN)(b)) - 1))
+#define ASAN_ROUND_DOWN(x, b)  (((UINTN)(x)) & ~(((UINTN)(b)) - 1))
 
-  for (UINTN i = 0; i < addr_shadow_end - addr_shadow_start; i++) {
-    if (*(UINT8 *)(addr_shadow_start + i) != 0) {
-      non_zero_shadow_addr = addr_shadow_start + i;
-      break;
-    }
+//
+// The scanners below run over shadow memory.  They MUST NOT be instrumented:
+// AsanMemoryLib* is compiled with -fsanitize=address and
+// -mllvm -asan-instrumentation-with-call-threshold=0, so an instrumented
+// shadow read compiles to a "call __asan_load1" -- one call per shadow byte.
+// no_sanitize_address turns that back into a plain load.
+//
+#if defined (__clang__) || defined (__GNUC__)
+  #define ASAN_NO_INSTRUMENT  __attribute__((no_sanitize("address")))
+#else
+  #define ASAN_NO_INSTRUMENT
+#endif
+
+//
+// TRUE when the single application byte at Addr is not accessible.
+// This is the general form of the "partial granule" rule: a non-zero shadow
+// byte N means only the first N bytes of that 8-byte granule are addressable.
+//
+ASAN_NO_INSTRUMENT
+static inline BOOLEAN asan_address_is_poisoned (UINTN Addr)
+{
+  UINTN  ShadowAddr;
+  INT8   ShadowValue;
+
+  ShadowAddr = MEM_TO_SHADOW (Addr);
+  if ((ShadowAddr < mAsanShadowMemoryStart_mem) ||
+      (ShadowAddr > mAsanShadowMemoryEnd_mem)) {
+    return FALSE;
   }
 
-  if (non_zero_shadow_addr) {
-    UINTN last_byte = addr + size - 1;
-    INT8 *last_shadow_byte = (INT8 *)MEM_TO_SHADOW(last_byte);
+  ShadowValue = *(INT8 *)ShadowAddr;
+  if (ShadowValue != 0) {
+    return (BOOLEAN)((INT8)(Addr & SHADOW_MASK) >= ShadowValue);
+  }
 
-    // Non-zero bytes in shadow memory may indicate either:
-    //  1) invalid memory access (0xff, 0xfa, ...)
-    //  2) access to a 8-byte region which isn't entirely accessible, i.e. only
-    //     n bytes can be read/written in the 8-byte region, where n < 8
-    //     (in this case shadow byte encodes how much bytes in an 8-byte region
-    //     are accessible).
-    // Thus, if there is a non-zero shadow byte we need to check if it
-    // corresponds to the last byte in the checked region:
-    //   not last - OOB memory access
-    //   last - check if we don't access beyond what's encoded in the shadow
-    //          byte.
-    if (non_zero_shadow_addr != (UINTN)last_shadow_byte ||
-        ((INT8)(last_byte & SHADOW_MASK) >= *last_shadow_byte))
-      return non_zero_shadow_addr;
+  return FALSE;
+}
+
+//
+// Word-at-a-time "is this shadow run all zero" test over [Beg, Beg+Size).
+// -fno-strict-aliasing is in CLANGSAN's CC_FLAGS, so the UINTN pun is fine.
+// The loop never reads past Beg+Size.
+//
+ASAN_NO_INSTRUMENT
+static inline BOOLEAN asan_shadow_is_zero (UINTN Beg, UINTN Size)
+{
+  UINTN  End;
+  UINTN  AlignedBeg;
+  UINTN  AlignedEnd;
+  UINTN  All;
+  UINTN  P;
+
+  End        = Beg + Size;
+  AlignedBeg = ASAN_ROUND_UP (Beg, sizeof (UINTN));
+  AlignedEnd = ASAN_ROUND_DOWN (End, sizeof (UINTN));
+  All        = 0;
+
+  if (AlignedBeg > End) {
+    AlignedBeg = End;
+  }
+
+  if (AlignedEnd < AlignedBeg) {
+    AlignedEnd = AlignedBeg;
+  }
+
+  for (P = Beg; P < AlignedBeg; P++) {
+    All |= *(UINT8 *)P;
+  }
+
+  for (P = AlignedBeg; P < AlignedEnd; P += sizeof (UINTN)) {
+    All |= *(UINTN *)P;
+  }
+
+  for (P = AlignedEnd; P < End; P++) {
+    All |= *(UINT8 *)P;
+  }
+
+  return (BOOLEAN)(All == 0);
+}
+
+//
+// Returns the SHADOW address of the first poisoned byte in [addr, addr+size),
+// or 0 when the whole range is addressable.  Callers (asan_bug_report) expect
+// a shadow address, so the slow path maps back through MEM_TO_SHADOW.
+//
+// Fast path is the compiler-rt __asan_region_is_poisoned algorithm: probe the
+// first and last application byte (covers both partial granules), then test
+// the granule-aligned interior 8 shadow bytes at a time.  That is exact -- no
+// sampling -- and turns the old O(Size/8) instrumented byte loop into
+// O(Size/64) plain loads.
+//
+ASAN_NO_INSTRUMENT
+static inline UINTN get_poisoned_shadow_address (UINTN addr, UINTN size)
+{
+  UINTN  aligned_b;
+  UINTN  aligned_e;
+  UINTN  shadow_beg;
+  UINTN  shadow_end;
+  UINTN  p;
+  UINTN  end;
+
+  if (size == 0) {
+    return 0;
+  }
+
+  end        = addr + size;
+  aligned_b  = ASAN_ROUND_UP (addr, SHADOW_GRANULARITY);
+  aligned_e  = ASAN_ROUND_DOWN (end, SHADOW_GRANULARITY);
+  shadow_beg = MEM_TO_SHADOW (aligned_b);
+  shadow_end = MEM_TO_SHADOW (aligned_e);
+
+  if (!asan_address_is_poisoned (addr) &&
+      !asan_address_is_poisoned (end - 1) &&
+      ((shadow_end <= shadow_beg) ||
+       asan_shadow_is_zero (shadow_beg, shadow_end - shadow_beg))) {
+    return 0;
+  }
+
+  //
+  // Something in the range is poisoned; find the first byte slowly.
+  //
+  for (p = addr; p < end; p++) {
+    if (asan_address_is_poisoned (p)) {
+      return MEM_TO_SHADOW (p);
+    }
   }
 
   return 0;
@@ -302,15 +402,26 @@ void asan_bug_report(UINTN addr, UINTN size,
   asan_print_bug(addr, size, file, line);
 
   asan_print_shadow_memory(buggy_address, 3, 3);
-  // ASAN_ASSERT(FALSE);
+  // AsanLib owns the escalation; this library has its own reporter and would
+  // otherwise print a CopyMem/SetMem overflow and let the iteration continue
+  AsanSignalSolution ();
 }
 
 static inline int asan_check_memory(UINTN addr, UINTN size,
                                      BOOLEAN write, UINTN pc, CHAR8 *file, UINTN line) {
   int buggy_shadow_address;
+  UINTN shadow_beg, shadow_end;
   if (size == 0) return 1;
 
-  if (addr > mAsanShadowMemoryStart_mem || addr < mAsanShadowMemoryEnd_mem) return 1;
+  // mAsanShadowMemory*_mem bound the SHADOW region (0x5000000..0x21000000),
+  // not the addresses being checked, so the guard has to be applied to the
+  // mapped shadow address -- exactly as the load/store callbacks in Asan.c do.
+  // As shipped this read `addr > Start || addr < End`, which is a tautology
+  // (Start < End) and made every CopyMem/SetMem check unreachable.
+  shadow_beg = MEM_TO_SHADOW(addr);
+  shadow_end = MEM_TO_SHADOW(addr + size - 1);
+  if (shadow_beg < mAsanShadowMemoryStart_mem ||
+      shadow_end > mAsanShadowMemoryEnd_mem) return 1;
 
   buggy_shadow_address = get_poisoned_shadow_address(addr, size);
   if (buggy_shadow_address == 0) return 1;
@@ -346,4 +457,153 @@ AsanInternalMemSetMem (
 {
   asan_check_memory((UINTN)Buffer, Length, TRUE, GET_CURRENT_PC(), File, Line);
   return InternalMemSetMem(Buffer, Length, Value);
+}
+
+VOID *
+EFIAPI
+AsanInternalMemZeroMem (
+  OUT     VOID   *Buffer,
+  IN      UINTN  Length,
+  IN CHAR8  *File,
+  IN UINTN  Line
+  )
+{
+  asan_check_memory ((UINTN)Buffer, Length, TRUE, GET_CURRENT_PC (), File, Line);
+  return InternalMemZeroMem (Buffer, Length);
+}
+
+INTN
+EFIAPI
+AsanInternalMemCompareMem (
+  IN      CONST VOID  *DestinationBuffer,
+  IN      CONST VOID  *SourceBuffer,
+  IN      UINTN       Length,
+  IN CHAR8  *File,
+  IN UINTN  Line
+  )
+{
+  asan_check_memory ((UINTN)DestinationBuffer, Length, FALSE, GET_CURRENT_PC (), File, Line);
+  asan_check_memory ((UINTN)SourceBuffer, Length, FALSE, GET_CURRENT_PC (), File, Line);
+  return InternalMemCompareMem (DestinationBuffer, SourceBuffer, Length);
+}
+
+BOOLEAN
+EFIAPI
+AsanInternalMemIsZeroBuffer (
+  IN CONST VOID  *Buffer,
+  IN UINTN       Length,
+  IN CHAR8  *File,
+  IN UINTN  Line
+  )
+{
+  asan_check_memory ((UINTN)Buffer, Length, FALSE, GET_CURRENT_PC (), File, Line);
+  return InternalMemIsZeroBuffer (Buffer, Length);
+}
+
+CONST VOID *
+EFIAPI
+AsanInternalMemScanMem8 (
+  IN      CONST VOID  *Buffer,
+  IN      UINTN       Length,
+  IN      UINT8       Value,
+  IN CHAR8  *File,
+  IN UINTN  Line
+  )
+{
+  //
+  // Length is a byte count here (element width is 1).
+  //
+  asan_check_memory ((UINTN)Buffer, Length, FALSE, GET_CURRENT_PC (), File, Line);
+  return InternalMemScanMem8 (Buffer, Length, Value);
+}
+
+CONST VOID *
+EFIAPI
+AsanInternalMemScanMem16 (
+  IN      CONST VOID  *Buffer,
+  IN      UINTN       Length,
+  IN      UINT16      Value,
+  IN CHAR8  *File,
+  IN UINTN  Line
+  )
+{
+  //
+  // Length is a COUNT of UINT16 elements (ScanMem16Wrapper already divided
+  // the caller's byte length by sizeof (UINT16)).
+  //
+  asan_check_memory ((UINTN)Buffer, Length * sizeof (UINT16), FALSE, GET_CURRENT_PC (), File, Line);
+  return InternalMemScanMem16 (Buffer, Length, Value);
+}
+
+CONST VOID *
+EFIAPI
+AsanInternalMemScanMem32 (
+  IN      CONST VOID  *Buffer,
+  IN      UINTN       Length,
+  IN      UINT32      Value,
+  IN CHAR8  *File,
+  IN UINTN  Line
+  )
+{
+  asan_check_memory ((UINTN)Buffer, Length * sizeof (UINT32), FALSE, GET_CURRENT_PC (), File, Line);
+  return InternalMemScanMem32 (Buffer, Length, Value);
+}
+
+CONST VOID *
+EFIAPI
+AsanInternalMemScanMem64 (
+  IN      CONST VOID  *Buffer,
+  IN      UINTN       Length,
+  IN      UINT64      Value,
+  IN CHAR8  *File,
+  IN UINTN  Line
+  )
+{
+  asan_check_memory ((UINTN)Buffer, Length * sizeof (UINT64), FALSE, GET_CURRENT_PC (), File, Line);
+  return InternalMemScanMem64 (Buffer, Length, Value);
+}
+
+VOID *
+EFIAPI
+AsanInternalMemSetMem16 (
+  OUT     VOID    *Buffer,
+  IN      UINTN   Length,
+  IN      UINT16  Value,
+  IN CHAR8  *File,
+  IN UINTN  Line
+  )
+{
+  //
+  // Length is a COUNT of UINT16 elements.
+  //
+  asan_check_memory ((UINTN)Buffer, Length * sizeof (UINT16), TRUE, GET_CURRENT_PC (), File, Line);
+  return InternalMemSetMem16 (Buffer, Length, Value);
+}
+
+VOID *
+EFIAPI
+AsanInternalMemSetMem32 (
+  OUT     VOID    *Buffer,
+  IN      UINTN   Length,
+  IN      UINT32  Value,
+  IN CHAR8  *File,
+  IN UINTN  Line
+  )
+{
+  asan_check_memory ((UINTN)Buffer, Length * sizeof (UINT32), TRUE, GET_CURRENT_PC (), File, Line);
+  return InternalMemSetMem32 (Buffer, Length, Value);
+}
+
+VOID *
+EFIAPI
+AsanInternalMemSetMem64 (
+  OUT     VOID    *Buffer,
+  IN      UINTN   Length,
+  IN      UINT64  Value,
+  IN CHAR8  *File,
+  IN UINTN  Line
+  )
+{
+  asan_check_memory ((UINTN)Buffer, Length * sizeof (UINT64), TRUE, GET_CURRENT_PC (), File, Line);
+  return InternalMemSetMem64 (Buffer, Length, Value);
 }

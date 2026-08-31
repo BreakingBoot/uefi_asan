@@ -53,7 +53,7 @@ ScanMem8 (
   ASSERT (Buffer != NULL);
   ASSERT ((Length - 1) <= (MAX_ADDRESS - (UINTN)Buffer));
 
-  return (VOID *)InternalMemScanMem8 (Buffer, Length, Value);
+  return (VOID *)AsanInternalMemScanMem8 (Buffer, Length, Value, __FILE__, __LINE__);
 }
 
 /**

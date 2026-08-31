@@ -59,7 +59,7 @@ SetMem (
   // SerialOut(NumStr);
   // SerialOut("\n");
 
-  return AsanInternalMemSetMem (Buffer, Length, Value);
+  return AsanInternalMemSetMem (Buffer, Length, Value, __FILE__, __LINE__);
 }
 
 /**

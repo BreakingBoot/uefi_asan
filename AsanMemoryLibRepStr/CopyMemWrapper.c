@@ -56,5 +56,5 @@ CopyMem (
     return DestinationBuffer;
   }
 
-  return AsanInternalMemCopyMem (DestinationBuffer, SourceBuffer, Length);
+  return AsanInternalMemCopyMem (DestinationBuffer, SourceBuffer, Length, __FILE__, __LINE__);
 }

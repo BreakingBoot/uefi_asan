@@ -57,5 +57,15 @@ CompareMem (
   ASSERT ((Length - 1) <= (MAX_ADDRESS - (UINTN)DestinationBuffer));
   ASSERT ((Length - 1) <= (MAX_ADDRESS - (UINTN)SourceBuffer));
 
+  //
+  // NOTE: routed to the unchecked InternalMemCompareMem on purpose. Enabling the
+  // checked variant produced 1462 boot-time reports in one run (the other nine
+  // primitives produced zero) -- reads of 20-46 bytes off globals with a partial
+  // last granule. Build with -D ASAN_CHECK_COMPAREMEM to turn it on.
+  //
+#ifdef ASAN_CHECK_COMPAREMEM
+  return AsanInternalMemCompareMem (DestinationBuffer, SourceBuffer, Length, __FILE__, __LINE__);
+#else
   return InternalMemCompareMem (DestinationBuffer, SourceBuffer, Length);
+#endif
 }

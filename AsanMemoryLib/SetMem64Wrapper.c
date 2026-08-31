@@ -54,5 +54,5 @@ SetMem64 (
   ASSERT ((((UINTN)Buffer) & (sizeof (Value) - 1)) == 0);
   ASSERT ((Length & (sizeof (Value) - 1)) == 0);
 
-  return InternalMemSetMem64 (Buffer, Length / sizeof (Value), Value);
+  return AsanInternalMemSetMem64 (Buffer, Length / sizeof (Value), Value, __FILE__, __LINE__);
 }

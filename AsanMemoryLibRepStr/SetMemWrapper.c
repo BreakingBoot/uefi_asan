@@ -47,7 +47,7 @@ SetMem (
 
   ASSERT ((Length - 1) <= (MAX_ADDRESS - (UINTN)Buffer));
 
-  return AsanInternalMemSetMem (Buffer, Length, Value);
+  return AsanInternalMemSetMem (Buffer, Length, Value, __FILE__, __LINE__);
 }
 
 /**

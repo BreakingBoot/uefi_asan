@@ -54,5 +54,5 @@ SetMem32 (
   ASSERT ((((UINTN)Buffer) & (sizeof (Value) - 1)) == 0);
   ASSERT ((Length & (sizeof (Value) - 1)) == 0);
 
-  return InternalMemSetMem32 (Buffer, Length / sizeof (Value), Value);
+  return AsanInternalMemSetMem32 (Buffer, Length / sizeof (Value), Value, __FILE__, __LINE__);
 }

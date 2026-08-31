@@ -45,7 +45,9 @@ EFIAPI
 AsanInternalMemCopyMem (
   OUT     VOID        *DestinationBuffer,
   IN      CONST VOID  *SourceBuffer,
-  IN      UINTN       Length
+  IN      UINTN       Length,
+  IN      CHAR8       *FileName,
+  IN      UINTN       LineNumber
   );
 
 VOID
@@ -82,7 +84,9 @@ EFIAPI
 AsanInternalMemSetMem (
   OUT     VOID   *Buffer,
   IN      UINTN  Length,
-  IN      UINT8  Value
+  IN      UINT8  Value,
+  IN      CHAR8  *FileName,
+  IN      UINTN  LineNumber
   );
 
 
@@ -268,6 +272,104 @@ EFIAPI
 InternalMemIsZeroBuffer (
   IN CONST VOID  *Buffer,
   IN UINTN       Length
+  );
+
+VOID *
+EFIAPI
+AsanInternalMemZeroMem (
+  OUT     VOID   *Buffer,
+  IN      UINTN  Length,
+  IN      CHAR8  *FileName,
+  IN      UINTN  LineNumber
+  );
+
+INTN
+EFIAPI
+AsanInternalMemCompareMem (
+  IN      CONST VOID  *DestinationBuffer,
+  IN      CONST VOID  *SourceBuffer,
+  IN      UINTN       Length,
+  IN      CHAR8       *FileName,
+  IN      UINTN       LineNumber
+  );
+
+BOOLEAN
+EFIAPI
+AsanInternalMemIsZeroBuffer (
+  IN CONST VOID  *Buffer,
+  IN UINTN       Length,
+  IN CHAR8       *FileName,
+  IN UINTN       LineNumber
+  );
+
+CONST VOID *
+EFIAPI
+AsanInternalMemScanMem8 (
+  IN      CONST VOID  *Buffer,
+  IN      UINTN       Length,
+  IN      UINT8       Value,
+  IN      CHAR8       *FileName,
+  IN      UINTN       LineNumber
+  );
+
+CONST VOID *
+EFIAPI
+AsanInternalMemScanMem16 (
+  IN      CONST VOID  *Buffer,
+  IN      UINTN       Length,
+  IN      UINT16      Value,
+  IN      CHAR8       *FileName,
+  IN      UINTN       LineNumber
+  );
+
+CONST VOID *
+EFIAPI
+AsanInternalMemScanMem32 (
+  IN      CONST VOID  *Buffer,
+  IN      UINTN       Length,
+  IN      UINT32      Value,
+  IN      CHAR8       *FileName,
+  IN      UINTN       LineNumber
+  );
+
+CONST VOID *
+EFIAPI
+AsanInternalMemScanMem64 (
+  IN      CONST VOID  *Buffer,
+  IN      UINTN       Length,
+  IN      UINT64      Value,
+  IN      CHAR8       *FileName,
+  IN      UINTN       LineNumber
+  );
+
+VOID *
+EFIAPI
+AsanInternalMemSetMem16 (
+  OUT     VOID    *Buffer,
+  IN      UINTN   Length,
+  IN      UINT16  Value,
+  IN      CHAR8   *FileName,
+  IN      UINTN   LineNumber
+  );
+
+VOID *
+EFIAPI
+AsanInternalMemSetMem32 (
+  OUT     VOID    *Buffer,
+  IN      UINTN   Length,
+  IN      UINT32  Value,
+  IN      CHAR8   *FileName,
+  IN      UINTN   LineNumber
+  );
+
+VOID *
+EFIAPI
+AsanInternalMemSetMem64 (
+  OUT     VOID    *Buffer,
+  IN      UINTN   Length,
+  IN      UINT64  Value,
+  IN      CHAR8   *FileName,
+  IN      UINTN   LineNumber
   );
 
 #endif

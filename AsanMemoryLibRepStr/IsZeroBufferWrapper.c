@@ -44,5 +44,5 @@ IsZeroBuffer (
 {
   ASSERT (!(Buffer == NULL && Length > 0));
   ASSERT ((Length - 1) <= (MAX_ADDRESS - (UINTN)Buffer));
-  return InternalMemIsZeroBuffer (Buffer, Length);
+  return AsanInternalMemIsZeroBuffer (Buffer, Length, __FILE__, __LINE__);
 }
