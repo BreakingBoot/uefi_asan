@@ -53,7 +53,11 @@ do {                            \
 
 
 // implemented in AsanLib, which is linked into every module that gets this library
-extern void AsanSignalSolution (VOID);
+// A weak definition, not a weak declaration. AsanSignalSolution lives in AsanLib,
+// which is not linked into every module that uses AsanMemoryLib; an undefined
+// weak reference leaves a relocation GenFw rejects with "ERROR 3000: Invalid",
+// so define a no-op here and let AsanLib's strong definition take precedence.
+__attribute__((weak)) void AsanSignalSolution (VOID) { }
 
 UINT64 mAsanShadowMemoryStart_mem = 0x5000000;
 UINT64 mAsanShadowMemorySize_mem  = 0x1C000000;
