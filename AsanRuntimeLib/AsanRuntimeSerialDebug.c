@@ -13,6 +13,13 @@
 **/
 
 //
+// Runs inside the report path; must not be instrumented. See AsanHelper.c.
+//
+#if defined (__clang__)
+#pragma clang attribute push (__attribute__((no_sanitize("address", "undefined"))), apply_to = function)
+#endif
+
+//
 // Local constant definitions
 //
 #define CONFIG_PORT0        0x2E
@@ -455,3 +462,7 @@ Num2Str8bit(
   NumStr[4] = 0;
   return ;
 }
+
+#if defined (__clang__)
+#pragma clang attribute pop
+#endif

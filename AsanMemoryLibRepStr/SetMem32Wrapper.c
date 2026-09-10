@@ -18,6 +18,19 @@
 
 #include "MemLibInternals.h"
 
+//
+// The sanitizer runtime must never be instrumented. A DSC global
+// "SAN_FLAGS ==" overrides an INF [BuildOptions], so this cannot be expressed
+// in the build files -- at ASAN_SCOPE=full the platform flags reach this file
+// whatever the INF says. Instrumenting it makes poisoning the shadow perform
+// shadow-of-shadow checks and lets a report recurse into itself. Checking here
+// is explicit (AsanInternal*/__asan_* call the shadow directly), so switching
+// compiler instrumentation off costs no detection.
+//
+#if defined (__clang__)
+#pragma clang attribute push (__attribute__((no_sanitize("address", "undefined"))), apply_to = function)
+#endif
+
 /**
   Fills a target buffer with a 32-bit value, and returns the target buffer.
 
@@ -56,3 +69,7 @@ SetMem32 (
 
   return AsanInternalMemSetMem32 (Buffer, Length / sizeof (Value), Value, __FILE__, __LINE__);
 }
+
+#if defined (__clang__)
+#pragma clang attribute pop
+#endif

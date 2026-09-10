@@ -16,6 +16,20 @@
 #include <Uefi.h>
 #include <Library/Asan.h>
 #include <Library/HobLib.h>
+#include <Guid/EventGroup.h>
+
+//
+// The sanitizer runtime must never be instrumented. A DSC global
+// "SAN_FLAGS ==" overrides an INF [BuildOptions], so this cannot be expressed
+// in the build files -- at ASAN_SCOPE=full the platform flags reach this file
+// whatever the INF says. Instrumenting it makes poisoning the shadow perform
+// shadow-of-shadow checks and lets a report recurse into itself. Checking here
+// is explicit (AsanInternal*/__asan_* call the shadow directly), so switching
+// compiler instrumentation off costs no detection.
+//
+#if defined (__clang__)
+#pragma clang attribute push (__attribute__((no_sanitize("address", "undefined"))), apply_to = function)
+#endif
 
 static const UINT64 kDefaultShadowScale = 3;
 #define SHADOW_SCALE kDefaultShadowScale
@@ -102,12 +116,24 @@ static BOOLEAN AdjacentShadowValuesAreFullyPoisoned(u8 *s) {
 // boot. While it is TRUE a report also tells the fuzzer the iteration is a solution.
 BOOLEAN mAsanFuzzingActive = FALSE;
 
+//
+// Armed at ReadyToBoot, or by a target that opens the window itself. Both are needed:
+// AsanLib is linked into every instrumented image and this flag is per image, so a
+// boot option -- which is loaded after ReadyToBoot has already been signalled -- never
+// sees that event and could otherwise never report. Measured: AsanSelfTest detected its
+// own overflow (9 reports against the control's 8) and the fuzzer recorded nothing.
+//
+STATIC BOOLEAN  mAsanReportArmed = FALSE;
+
 VOID
 AsanSetFuzzingActive (
   IN BOOLEAN Active
   )
 {
   mAsanFuzzingActive = Active;
+  if (Active) {
+    mAsanReportArmed = TRUE;
+  }
 }
 
 // Report the current iteration to TSFFS as a solution. This is the tsffs.h
@@ -115,8 +141,74 @@ AsanSetFuzzingActive (
 // carry a fuzzer header: cpuid with eax = (N_STOP_ASSERT << 16) | MAGIC.
 // Without it a detected error is printed and then executed, and TSFFS -- which only
 // scores exceptions 12/13/14 -- never sees it.
+//
+// How a sanitizer report reaches the fuzzer. Two fuzzers, two instructions, and they are
+// not interchangeable: TSFFS watches for a cpuid with a magic eax, while LibAFL-QEMU
+// pattern matches four bytes during translation. Emitting the cpuid under LibAFL-QEMU is
+// not an error -- cpuid is a legal instruction -- it simply does nothing, which is why an
+// instrumented OVMF reported memory errors on the serial log and the fuzzer recorded
+// zero objectives.
+//
+// Selected by ASAN_FUZZER_BACKEND, set per module in the platform dsc. 1 is TSFFS and the
+// default, so a platform that says nothing keeps the behaviour it had.
+//
+#define ASAN_FUZZER_TSFFS       1
+#define ASAN_FUZZER_LIBAFL_QEMU 2
+
+#ifndef ASAN_FUZZER_BACKEND
+#define ASAN_FUZZER_BACKEND  ASAN_FUZZER_TSFFS
+#endif
+
+//
+// Reporting under libafl-qemu is gated twice, and both gates are load-bearing.
+//
+// ReadyToBoot arms it, because LIBAFL_QEMU_COMMAND_END before the first START aborts
+// the whole run with EndBeforeStart, and this firmware raises hundreds of reports while
+// it boots.
+//
+// Arming was once the only gate, on the reasoning that the harness is a boot option so
+// anything after ReadyToBoot belongs to an iteration. That is false: HiiDatabase exports
+// its package lists between the two, and those findings ended every iteration before the
+// harness ran. So the window opened by AsanSetFuzzingActive is required as well, exactly
+// as it is under TSFFS. A target that is not the generated harness -- AsanSelfTest, say --
+// has to open it for itself.
+//
+#if ASAN_FUZZER_BACKEND == ASAN_FUZZER_LIBAFL_QEMU
+
+STATIC
+VOID
+EFIAPI
+AsanArmReporting (
+  IN EFI_EVENT  Event,
+  IN VOID       *Context
+  )
+{
+  mAsanReportArmed = TRUE;
+}
+#endif
+
 void AsanSignalSolution (VOID)
 {
+#if ASAN_FUZZER_BACKEND == ASAN_FUZZER_LIBAFL_QEMU
+  UINT64  Ret = 4;  // LIBAFL_QEMU_COMMAND_END
+
+  //
+  // Both gates. Arming at ReadyToBoot alone is not enough: HiiDatabase exports its
+  // package lists after that event and before the boot option runs, so its UBSan
+  // findings ended five iterations out of five with the harness never reached
+  // (measured 2026-09-09, objectives 5, executions 5, corpus 0). The armed flag
+  // still matters on its own: an END before the first START aborts the run with
+  // EndBeforeStart.
+  //
+  if (!mAsanReportArmed || !mAsanFuzzingActive) {
+    return;
+  }
+
+  __asm__ __volatile__ (".byte 0x0f, 0x3a, 0xf2, 0x66\n\t"
+                        : "+a" (Ret)
+                        : "D" ((UINT64)2)
+                        : "memory", "cc");
+#else
   unsigned int _a = 0, _b = 0, _c = 0, _d = 0;
   unsigned int value = (0x0005U << 0x10U) | 0x4711U;
 
@@ -127,6 +219,7 @@ void AsanSignalSolution (VOID)
   __asm__ __volatile__ ("cpuid\n\t"
                         : "=a"(_a), "=b"(_b), "=c"(_c), "=d"(_d)
                         : "a"(value), "D"(0));
+#endif
 }
 
 void ReportGenericError(UINTN addr, BOOLEAN is_write, UINTN access_size) {
@@ -325,6 +418,14 @@ void __asan_report_store_n_noabort(UINTN addr, UINTN size)
 // fuzzing also ends the iteration as a solution
 void AsanSignalSolution (VOID);
 
+//
+// Only frame 0. __builtin_return_address(N) for N > 0 walks saved frame pointers,
+// and the compiler documents that as unsafe beyond the current frame: past the
+// outermost one it dereferences whatever is on the stack. These reports walked nine
+// frames, so the first finding of a boot ended in a #GP inside __asan_store1 with
+// r15 holding code bytes rather than a frame -- the error was detected correctly and
+// then killed the run while reporting it, which capped every boot at one finding.
+//
 #define SANITIZER_CALLSTACK_DUMP(fun_name)                                \
 {                                                                         \
   CHAR8 NumStr[19];                                                       \
@@ -338,21 +439,6 @@ void AsanSignalSolution (VOID);
   SerialOutput ("\n");                                                    \
   AsanSignalSolution ();                                                  \
 }
-  // Num2Str64bit ((UINTN)__builtin_return_address(1),NumStr);
-  // SerialOutput (NumStr);
-  // SerialOutput ("\n");
-  // Num2Str64bit ((UINTN)__builtin_return_address(2),NumStr);
-  // SerialOutput (NumStr);
-  // SerialOutput ("\n");
-  // Num2Str64bit ((UINTN)__builtin_return_address(3),NumStr);
-  // SerialOutput (NumStr);
-  // SerialOutput ("\n");
-  // Num2Str64bit ((UINTN)__builtin_return_address(4),NumStr);
-  // SerialOutput (NumStr);
-  // SerialOutput ("\n");
-  // Num2Str64bit ((UINTN)__builtin_return_address(5),NumStr);
-  // SerialOutput (NumStr);
-  // SerialOutput ("\n");
 //
 // Note: Using __builtin_return_address(1~n) in below code might cause CPU exception
 // because the call stack during running don't always have n deep in fact. You can just 
@@ -385,31 +471,7 @@ void __asan_load##size(UINTN addr)          \
               Num2Str64bit ((UINTN)__builtin_return_address(0),NumStr);       \
               SerialOutput (NumStr);                                                  \
               SerialOutput ("\n");                                                    \
-              Num2Str64bit ((UINTN)__builtin_return_address(1),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\n");                                                    \
-              Num2Str64bit ((UINTN)__builtin_return_address(2),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\n");                                                    \
-              Num2Str64bit ((UINTN)__builtin_return_address(3),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\n");                                                    \
-              Num2Str64bit ((UINTN)__builtin_return_address(4),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\n");                                                    \
               AsanSignalSolution ();                                      \
-              Num2Str64bit ((UINTN)__builtin_return_address(5),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\n");                                                    \
-              Num2Str64bit ((UINTN)__builtin_return_address(6),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\n");                                                    \
-              Num2Str64bit ((UINTN)__builtin_return_address(7),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\n");                                                    \
-              Num2Str64bit ((UINTN)__builtin_return_address(8),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\nAccess Address= ");                                    \
               Num2Str64bit (addr, NumStr);                                            \
               SerialOutput (NumStr);                                                  \
               SerialOutput (", Shadow Memory Address= ");                             \
@@ -453,31 +515,7 @@ void __asan_store##size(UINTN addr)         \
               Num2Str64bit ((UINTN)__builtin_return_address(0),NumStr);       \
               SerialOutput (NumStr);                                                  \
               SerialOutput ("\n");                                                    \
-              Num2Str64bit ((UINTN)__builtin_return_address(1),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\n");                                                    \
-              Num2Str64bit ((UINTN)__builtin_return_address(2),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\n");                                                    \
-              Num2Str64bit ((UINTN)__builtin_return_address(3),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\n");                                                    \
-              Num2Str64bit ((UINTN)__builtin_return_address(4),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\n");                                                    \
               AsanSignalSolution ();                                      \
-              Num2Str64bit ((UINTN)__builtin_return_address(5),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\n");                                                    \
-              Num2Str64bit ((UINTN)__builtin_return_address(6),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\n");                                                    \
-              Num2Str64bit ((UINTN)__builtin_return_address(7),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\n");                                                    \
-              Num2Str64bit ((UINTN)__builtin_return_address(8),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\nAccess Address= ");                                    \
               Num2Str64bit (addr, NumStr);                                            \
               SerialOutput (NumStr);                                                  \
               SerialOutput (", Shadow Memory Address= ");                             \
@@ -519,28 +557,7 @@ void __asan_load##size##_noabort(UINTN addr)  \
               Num2Str64bit ((UINTN)__builtin_return_address(0),NumStr);       \
               SerialOutput (NumStr);                                                  \
               SerialOutput ("\n");                                                    \
-              Num2Str64bit ((UINTN)__builtin_return_address(1),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\n");                                                    \
-              Num2Str64bit ((UINTN)__builtin_return_address(2),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\n");                                                    \
-              Num2Str64bit ((UINTN)__builtin_return_address(3),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\n");                                                    \
-              Num2Str64bit ((UINTN)__builtin_return_address(4),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\n");                                                    \
               AsanSignalSolution ();                                      \
-              Num2Str64bit ((UINTN)__builtin_return_address(5),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\n");                                                    \
-              Num2Str64bit ((UINTN)__builtin_return_address(6),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\n");                                                    \
-              Num2Str64bit ((UINTN)__builtin_return_address(7),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\n");                                                    \
               SerialOutput ("Access Address= ");                                   \
               Num2Str64bit (addr, NumStr);                                            \
               SerialOutput (NumStr);                                                  \
@@ -584,28 +601,7 @@ void __asan_store##size##_noabort(UINTN addr)   \
               Num2Str64bit ((UINTN)__builtin_return_address(0),NumStr);       \
               SerialOutput (NumStr);                                                  \
               SerialOutput ("\n");                                                    \
-              Num2Str64bit ((UINTN)__builtin_return_address(1),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\n");                                                    \
-              Num2Str64bit ((UINTN)__builtin_return_address(2),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\n");                                                    \
-              Num2Str64bit ((UINTN)__builtin_return_address(3),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\n");                                                    \
-              Num2Str64bit ((UINTN)__builtin_return_address(4),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\n");                                                    \
               AsanSignalSolution ();                                      \
-              Num2Str64bit ((UINTN)__builtin_return_address(5),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\n");                                                    \
-              Num2Str64bit ((UINTN)__builtin_return_address(6),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\n");                                                    \
-              Num2Str64bit ((UINTN)__builtin_return_address(7),NumStr);       \
-              SerialOutput (NumStr);                                                  \
-              SerialOutput ("\n");                                                    \
               SerialOutput ("Access Address= ");                                      \
               Num2Str64bit (addr, NumStr);                                            \
               SerialOutput (NumStr);                                                  \
@@ -745,18 +741,6 @@ void __asan_loadN_noabort(UINTN addr, UINTN size)
     Num2Str64bit ((UINTN)__builtin_return_address(0),NumStr);
     SerialOutput (NumStr);
     SerialOutput ("\n");
-    Num2Str64bit ((UINTN)__builtin_return_address(1),NumStr);
-    SerialOutput (NumStr);
-    SerialOutput ("\n");
-    Num2Str64bit ((UINTN)__builtin_return_address(2),NumStr);
-    SerialOutput (NumStr);
-    SerialOutput ("\n");
-    Num2Str64bit ((UINTN)__builtin_return_address(3),NumStr);
-    SerialOutput (NumStr);
-    SerialOutput ("\n");
-    Num2Str64bit ((UINTN)__builtin_return_address(4),NumStr);
-    SerialOutput (NumStr);
-    SerialOutput ("\nAccess Address= ");
     Num2Str64bit (addr, NumStr);
     SerialOutput (NumStr);
     SerialOutput (", Shadow Memory Address= ");
@@ -796,18 +780,6 @@ void __asan_storeN_noabort(UINTN addr, UINTN size)
     Num2Str64bit ((UINTN)__builtin_return_address(0),NumStr);
     SerialOutput (NumStr);
     SerialOutput ("\n");
-    Num2Str64bit ((UINTN)__builtin_return_address(1),NumStr);
-    SerialOutput (NumStr);
-    SerialOutput ("\n");
-    Num2Str64bit ((UINTN)__builtin_return_address(2),NumStr);
-    SerialOutput (NumStr);
-    SerialOutput ("\n");
-    Num2Str64bit ((UINTN)__builtin_return_address(3),NumStr);
-    SerialOutput (NumStr);
-    SerialOutput ("\n");
-    Num2Str64bit ((UINTN)__builtin_return_address(4),NumStr);
-    SerialOutput (NumStr);
-    SerialOutput ("\nAccess Address= ");
     Num2Str64bit (addr, NumStr);
     SerialOutput (NumStr);
     SerialOutput (", Shadow Memory Address= ");
@@ -847,18 +819,6 @@ void __asan_loadN(UINTN addr, UINTN size)
     Num2Str64bit ((UINTN)__builtin_return_address(0),NumStr);
     SerialOutput (NumStr);
     SerialOutput ("\n");
-    Num2Str64bit ((UINTN)__builtin_return_address(1),NumStr);
-    SerialOutput (NumStr);
-    SerialOutput ("\n");
-    Num2Str64bit ((UINTN)__builtin_return_address(2),NumStr);
-    SerialOutput (NumStr);
-    SerialOutput ("\n");
-    Num2Str64bit ((UINTN)__builtin_return_address(3),NumStr);
-    SerialOutput (NumStr);
-    SerialOutput ("\n");
-    Num2Str64bit ((UINTN)__builtin_return_address(4),NumStr);
-    SerialOutput (NumStr);
-    SerialOutput ("\nAccess Address= ");
     Num2Str64bit (addr, NumStr);
     SerialOutput (NumStr);
     SerialOutput (", Shadow Memory Address= ");
@@ -898,18 +858,6 @@ void __asan_storeN(UINTN addr, UINTN size)
     Num2Str64bit ((UINTN)__builtin_return_address(0),NumStr);
     SerialOutput (NumStr);
     SerialOutput ("\n");
-    Num2Str64bit ((UINTN)__builtin_return_address(1),NumStr);
-    SerialOutput (NumStr);
-    SerialOutput ("\n");
-    Num2Str64bit ((UINTN)__builtin_return_address(2),NumStr);
-    SerialOutput (NumStr);
-    SerialOutput ("\n");
-    Num2Str64bit ((UINTN)__builtin_return_address(3),NumStr);
-    SerialOutput (NumStr);
-    SerialOutput ("\n");
-    Num2Str64bit ((UINTN)__builtin_return_address(4),NumStr);
-    SerialOutput (NumStr);
-    SerialOutput ("\nAccess Address= ");
     Num2Str64bit (addr, NumStr);
     SerialOutput (NumStr);
     SerialOutput (", Shadow Memory Address= ");
@@ -1667,6 +1615,23 @@ void __ubsan_handle_pointer_overflow(struct OverflowDescData *Data, UINTN Base, 
   SerialOutput (", column:");
   Num2Str16bit (Data->Loc.column, NumStr);
   SerialOutput (NumStr);
+  SerialOutput (" ErrorType = ");
+  if (Base == 0 || Result == 0) {
+    //
+    // The common case by far, and much the least alarming: an offset applied to a
+    // null pointer, which UEFI code does routinely on a size-query pass where the
+    // result is never dereferenced. Worth telling apart from a real wrap.
+    //
+    SerialOutput ("NullPointerArithmetic: offset applied to a null pointer base ");
+  } else {
+    SerialOutput ("PointerOverflow: pointer index expression overflowed base ");
+  }
+
+  Num2Str64bit (Base, NumStr);
+  SerialOutput (NumStr);
+  SerialOutput (" result ");
+  Num2Str64bit (Result, NumStr);
+  SerialOutput (NumStr);
   SerialOutput ("\n");
   SANITIZER_CALLSTACK_DUMP("__ubsan_handle_pointer_overflow");
 }
@@ -1679,6 +1644,23 @@ void __ubsan_handle_pointer_overflow_abort(struct OverflowDescData *Data, UINTN 
   SerialOutput (NumStr);
   SerialOutput (", column:");
   Num2Str16bit (Data->Loc.column, NumStr);
+  SerialOutput (NumStr);
+  SerialOutput (" ErrorType = ");
+  if (Base == 0 || Result == 0) {
+    //
+    // The common case by far, and much the least alarming: an offset applied to a
+    // null pointer, which UEFI code does routinely on a size-query pass where the
+    // result is never dereferenced. Worth telling apart from a real wrap.
+    //
+    SerialOutput ("NullPointerArithmetic: offset applied to a null pointer base ");
+  } else {
+    SerialOutput ("PointerOverflow: pointer index expression overflowed base ");
+  }
+
+  Num2Str64bit (Base, NumStr);
+  SerialOutput (NumStr);
+  SerialOutput (" result ");
+  Num2Str64bit (Result, NumStr);
   SerialOutput (NumStr);
   SerialOutput ("\n");
   SANITIZER_CALLSTACK_DUMP("__ubsan_handle_pointer_overflow_abort");
@@ -1794,6 +1776,24 @@ AsanLibConstructor (
   SerialOutput ("AsanLibConstructor begin\n");
   SerialOutput ("Get hob of gAsanInfoGuid\n");
 
+#if ASAN_FUZZER_BACKEND == ASAN_FUZZER_LIBAFL_QEMU
+  //
+  // DxeCore gets a NULL SystemTable here, so it never arms. That is the right outcome:
+  // an out of bounds access is reported by whoever makes it, and the drivers under test
+  // are the ones that do.
+  //
+  if ((SystemTable != NULL) && (SystemTable->BootServices != NULL)) {
+    EFI_EVENT  ReadyToBoot;
+
+    if (!EFI_ERROR (SystemTable->BootServices->CreateEventEx (
+                      EVT_NOTIFY_SIGNAL, TPL_CALLBACK, AsanArmReporting,
+                      NULL, &gEfiEventReadyToBootGuid, &ReadyToBoot)))
+    {
+      SerialOutput ("AsanLib: reporting arms at ReadyToBoot\n");
+    }
+  }
+#endif
+
   if (AsanCtorFlag) {
     return RETURN_SUCCESS;//Status;
   } else {
@@ -1828,3 +1828,7 @@ AsanLibConstructor (
   SerialOutput ("AsanLibConstructor done\n");
   return RETURN_SUCCESS;
 }
+
+#if defined (__clang__)
+#pragma clang attribute pop
+#endif

@@ -13,6 +13,19 @@
 **/
 #include "MemLibInternals.h"
 
+//
+// The sanitizer runtime must never be instrumented. A DSC global
+// "SAN_FLAGS ==" overrides an INF [BuildOptions], so this cannot be expressed
+// in the build files -- at ASAN_SCOPE=full the platform flags reach this file
+// whatever the INF says. Instrumenting it makes poisoning the shadow perform
+// shadow-of-shadow checks and lets a report recurse into itself. Checking here
+// is explicit (AsanInternal*/__asan_* call the shadow directly), so switching
+// compiler instrumentation off costs no detection.
+//
+#if defined (__clang__)
+#pragma clang attribute push (__attribute__((no_sanitize("address", "undefined"))), apply_to = function)
+#endif
+
 static const UINT64 kDefaultShadowScale = 3;
 #define SHADOW_SCALE kDefaultShadowScale
 static const UINT32 kStackTraceMax = 255;
@@ -308,14 +321,23 @@ static void asan_print_shadow_memory(UINTN address, INTN range_before,
   }
 }
 
-void asan_print_bug(UINTN addr, UINTN size, CHAR8 *file, UINTN line)
+//
+// buggy_shadow_address is the byte the range check actually failed on. Deriving it
+// from addr instead, as this did, classifies on the *start* of the access: a long
+// copy that begins inside its allocation and runs off the end has shadow 0 there, so
+// no case matched and every one of them was reported as unknown-crash. The 62KB
+// overflow out of the FVB path was exactly that, and it is a heap-buffer-overflow.
+//
+void asan_print_bug(UINTN addr, UINTN size, UINTN buggy_shadow_address,
+                    CHAR8 *file, UINTN line)
 {
     // Determine the error type.
   const CHAR8 *bug_descr = "unknown-crash";
   UINT8 shadow_val = 0;
   int read_after_free_bonus = 0;
   BOOLEAN far_from_bounds = FALSE;
-  UINT8 *shadow_addr = (UINT8*)MEM_TO_SHADOW(addr);
+  UINT8 *shadow_addr = (UINT8*)(buggy_shadow_address ? buggy_shadow_address
+                                                      : MEM_TO_SHADOW(addr));
   // If we are accessing 16 bytes, look at the second shadow byte.
   if (*shadow_addr == 0 && size > SHADOW_GRANULARITY)
     shadow_addr++;
@@ -403,7 +425,7 @@ void asan_bug_report(UINTN addr, UINTN size,
   NumStr64bit(ip, NumStr);
   SerialOut(NumStr);
   SerialOut("\n");
-  asan_print_bug(addr, size, file, line);
+  asan_print_bug(addr, size, buggy_shadow_address, file, line);
 
   asan_print_shadow_memory(buggy_address, 3, 3);
   // AsanLib owns the escalation; this library has its own reporter and would
@@ -611,3 +633,7 @@ AsanInternalMemSetMem64 (
   asan_check_memory ((UINTN)Buffer, Length * sizeof (UINT64), TRUE, GET_CURRENT_PC (), File, Line);
   return InternalMemSetMem64 (Buffer, Length, Value);
 }
+
+#if defined (__clang__)
+#pragma clang attribute pop
+#endif
