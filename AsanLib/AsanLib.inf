@@ -24,6 +24,7 @@
   VERSION_STRING                 = 1.0
   LIBRARY_CLASS                  = AsanLib|DXE_DRIVER DXE_RUNTIME_DRIVER DXE_SAL_DRIVER DXE_SMM_DRIVER UEFI_APPLICATION UEFI_DRIVER DXE_CORE SMM_CORE
   CONSTRUCTOR                    = AsanLibConstructor
+  DESTRUCTOR                     = AsanLibDestructor
   
 #
 #  VALID_ARCHITECTURES           = IA32 X64 

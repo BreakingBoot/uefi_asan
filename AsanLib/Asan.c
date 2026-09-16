@@ -125,6 +125,18 @@ BOOLEAN mAsanFuzzingActive = FALSE;
 //
 STATIC BOOLEAN  mAsanReportArmed = FALSE;
 
+//
+// The arming event, kept so the destructor can close it. A library constructor runs in
+// every module that links AsanLib, and several of those modules do not survive: a DXE
+// driver whose entry point returns an error is unloaded by the core, and OVMF has five
+// of them -- "Image at 0001D95B000 start failed: Unsupported" and friends. The event it
+// registered stays on the ReadyToBoot list with a notify function pointing into the
+// image that has just been freed, and when BDS signals the group the core calls it. The
+// boot then dies with #UD somewhere that is not code at all: in one run at the
+// EFI_GLOBAL_VARIABLE guid in BdsDxe's .data, whose first byte 0x61 is POPA and invalid
+// in 64-bit mode. 26 of the 90 registered notifications had run by then.
+//
+
 VOID
 AsanSetFuzzingActive (
   IN BOOLEAN Active
@@ -174,6 +186,8 @@ AsanSetFuzzingActive (
 // has to open it for itself.
 //
 #if ASAN_FUZZER_BACKEND == ASAN_FUZZER_LIBAFL_QEMU
+
+STATIC EFI_EVENT  mAsanReadyToBootEvent = NULL;
 
 STATIC
 VOID
@@ -1763,6 +1777,32 @@ SetupAsanShadowMemory (
 }
 
 
+//
+// Close the arming event when this module goes away.
+//
+// UefiDriverEntryPoint calls ProcessLibraryDestructorList when the module entry point
+// returns an error, which is exactly the case that leaves a dangling notification
+// behind, and the same list runs when a driver is unloaded for any other reason.
+//
+RETURN_STATUS
+EFIAPI
+AsanLibDestructor (
+  IN EFI_HANDLE        ImageHandle,
+  IN EFI_SYSTEM_TABLE  *SystemTable
+  )
+{
+#if ASAN_FUZZER_BACKEND == ASAN_FUZZER_LIBAFL_QEMU
+  if ((mAsanReadyToBootEvent != NULL) &&
+      (SystemTable != NULL) && (SystemTable->BootServices != NULL))
+  {
+    SystemTable->BootServices->CloseEvent (mAsanReadyToBootEvent);
+    mAsanReadyToBootEvent = NULL;
+  }
+#endif
+  return RETURN_SUCCESS;
+}
+
+
 RETURN_STATUS
 EFIAPI
 AsanLibConstructor (
@@ -1783,11 +1823,9 @@ AsanLibConstructor (
   // are the ones that do.
   //
   if ((SystemTable != NULL) && (SystemTable->BootServices != NULL)) {
-    EFI_EVENT  ReadyToBoot;
-
     if (!EFI_ERROR (SystemTable->BootServices->CreateEventEx (
                       EVT_NOTIFY_SIGNAL, TPL_CALLBACK, AsanArmReporting,
-                      NULL, &gEfiEventReadyToBootGuid, &ReadyToBoot)))
+                      NULL, &gEfiEventReadyToBootGuid, &mAsanReadyToBootEvent)))
     {
       SerialOutput ("AsanLib: reporting arms at ReadyToBoot\n");
     }
