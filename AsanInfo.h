@@ -24,6 +24,16 @@ typedef struct {
   UINT64       AsanShadowMemoryStart;
   UINT32       AsanInited;
   UINT32       AsanActivated;
+  //
+  // The fuzzing window, shared. AsanLib is a static library, so every instrumented
+  // module has its own copy of every one of its variables: a harness opening the window
+  // in its own copy leaves all 100-odd drivers with theirs still closed, and a finding
+  // in the driver under test is printed to the serial port and never escalated. One run
+  // against EFI_DEVICE_PATH_UTILITIES_PROTOCOL logged 714 findings and scored 4
+  // solutions, none of them a sanitizer report. This field is in the HOB, which every
+  // module reads through the same pointer.
+  //
+  UINT32       AsanFuzzingActive;
 } ASAN_INFO;
 
 extern EFI_GUID gAsanInfoGuid;
