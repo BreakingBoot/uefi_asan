@@ -97,6 +97,34 @@ AsanSetFuzzingActive (
   IN BOOLEAN  Active
   );
 
+//
+// Memory a driver has no business reading, named rather than sized. ASan describes
+// allocations, so it has nothing to say about a pointer into flash, MMIO or SMRAM:
+// the access is in bounds of something real, it is simply in bounds of the wrong
+// thing. That is the shape of an SMM callout, and it is the one firmware fault class
+// a shadow of allocations cannot express.
+//
+// Policy lives in whoever calls Register -- this only holds the list and answers the
+// question, because AsanLib is what the memory interceptors already link against.
+//
+VOID
+AsanRegisterProtectedRegion (
+  IN UINT64       Base,
+  IN UINT64       Size,
+  IN CONST CHAR8  *Name
+  );
+
+VOID
+AsanSetRegionChecks (
+  IN BOOLEAN  Active
+  );
+
+CONST CHAR8 *
+AsanProtectedRegionName (
+  IN UINT64  Address,
+  IN UINT64  Size
+  );
+
 extern UINTN __asan_shadow_memory_dynamic_address;
 extern int __asan_option_detect_stack_use_after_return;
 extern UINT64 mAsanShadowMemoryStart;

@@ -72,6 +72,17 @@ do {                            \
 // so define a no-op here and let AsanLib's strong definition take precedence.
 __attribute__((weak)) void AsanSignalSolution (VOID) { }
 
+// Same reason, same shape. Without AsanLib there is no region list to consult and
+// nowhere to say so, and answering "no region" leaves every check exactly as it was.
+__attribute__((weak)) CONST CHAR8 *AsanProtectedRegionName (UINT64 Address, UINT64 Size)
+{
+  (VOID)Address;
+  (VOID)Size;
+  return NULL;
+}
+
+__attribute__((weak)) void SerialOutput (CONST CHAR8 *String) { (VOID)String; }
+
 UINT64 mAsanShadowMemoryStart_mem = 0x5000000;
 UINT64 mAsanShadowMemorySize_mem  = 0x1C000000;
 UINT64 mAsanShadowMemoryEnd_mem   = 0x21000000;
@@ -437,7 +448,26 @@ static inline int asan_check_memory(UINTN addr, UINTN size,
                                      BOOLEAN write, UINTN pc, CHAR8 *file, UINTN line) {
   int buggy_shadow_address;
   UINTN shadow_beg, shadow_end;
+  CONST CHAR8 *region;
   if (size == 0) return 1;
+
+  // Before the shadow guard, not after: flash and MMIO sit outside the mapped shadow,
+  // so their shadow address fails the range test below and the check returns clean
+  // having looked at nothing. An access to one of these is in bounds of real memory --
+  // there is no poisoned byte to find -- and wrong for a reason the shadow cannot hold.
+  region = AsanProtectedRegionName ((UINT64)addr, (UINT64)size);
+  if (region != NULL) {
+    SerialOutput ("FWSAN: foreign-region access -- ");
+    SerialOutput (region);
+    SerialOutput ("\n");
+    // No shadow dump. There is no shadow for flash or MMIO -- that is the whole reason
+    // this check exists -- and asking asan_print_shadow_memory to render one walks tens
+    // of thousands of bytes of unmapped shadow, which is both meaningless and slow
+    // enough to look like a hang. Escalation is the part that matters and it is gated
+    // exactly as every other finding is.
+    AsanSignalSolution ();
+    return 0;
+  }
 
   // mAsanShadowMemory*_mem bound the SHADOW region (0x5000000..0x21000000),
   // not the addresses being checked, so the guard has to be applied to the

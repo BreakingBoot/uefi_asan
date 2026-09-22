@@ -34,6 +34,20 @@ typedef struct {
   // module reads through the same pointer.
   //
   UINT32       AsanFuzzingActive;
+  //
+  // Regions a driver has no business touching, shared for exactly the reason above.
+  // FwSanDxe decides what belongs on the list and every instrumented module has to be
+  // able to consult it -- registering into a per-module copy means the module that did
+  // the registering is the only one that ever checks anything, which is a check that
+  // passes everywhere it is not needed.
+  //
+  // Bases and ends rather than a descriptor with a name: a pointer to a string in one
+  // image is not something another image should be dereferencing out of a HOB.
+  //
+  UINT32       AsanRegionChecksActive;
+  UINT32       AsanProtectedRegionCount;
+  UINT64       AsanProtectedRegionBase[8];
+  UINT64       AsanProtectedRegionEnd[8];
 } ASAN_INFO;
 
 extern EFI_GUID gAsanInfoGuid;

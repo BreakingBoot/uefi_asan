@@ -233,6 +233,106 @@ AsanArmReporting (
 }
 #endif
 
+//
+// Regions a driver has no business touching. ASan describes allocations, so it has
+// nothing to say about a pointer into flash, MMIO or SMRAM: the access is in bounds of
+// something real, it is simply in bounds of the wrong thing. That is the shape of an
+// SMM callout, and it is the firmware fault class a shadow of allocations cannot
+// express at all.
+//
+// Eight slots, in a fixed array: this is consulted from the memory interceptors, and an
+// allocation there would recurse into the allocator being instrumented.
+//
+#define ASAN_PROTECTED_REGIONS  8
+
+STATIC BOOLEAN                mRegionChecksActive   = FALSE;
+
+//
+// Whether the region check looks at all, which is not the same question as whether
+// a finding should end the iteration. Tying the two together means the only way to
+// enable the check outside a campaign is to open the escalation window, and
+// escalation is a LibAFL command -- an invalid opcode anywhere else, so a plain boot
+// dies on the first report instead of scoring the rest.
+//
+VOID
+AsanSetRegionChecks (
+  IN BOOLEAN  Active
+  )
+{
+  mRegionChecksActive = Active;
+  if (mAsanInfo != NULL) {
+    mAsanInfo->AsanRegionChecksActive = Active ? 1 : 0;
+  }
+}
+
+VOID
+AsanRegisterProtectedRegion (
+  IN UINT64       Base,
+  IN UINT64       Size,
+  IN CONST CHAR8  *Name
+  )
+{
+  UINT32  Slot;
+
+  //
+  // Into the HOB, not into a static. AsanLib is a static library and every instrumented
+  // module has its own copy of its variables, so a list built here would be consulted
+  // only by the module that built it -- and that module is the sanitizer, which is the
+  // one place the check is never needed.
+  //
+  (VOID)Name;
+  if ((Size == 0) || (mAsanInfo == NULL)) {
+    return;
+  }
+
+  Slot = mAsanInfo->AsanProtectedRegionCount;
+  if (Slot >= ASAN_PROTECTED_REGIONS) {
+    return;
+  }
+
+  mAsanInfo->AsanProtectedRegionBase[Slot] = Base;
+  mAsanInfo->AsanProtectedRegionEnd[Slot]  = Base + Size - 1;
+  mAsanInfo->AsanProtectedRegionCount      = Slot + 1;
+}
+
+CONST CHAR8 *
+AsanProtectedRegionName (
+  IN UINT64  Address,
+  IN UINT64  Size
+  )
+{
+  UINT32  Index;
+  UINT64  Last;
+
+  //
+  // Two switches, deliberately. AsanRegionChecksActive says whether to look at all;
+  // the fuzzing window says whether a finding should end the iteration. Tying them
+  // together means the only way to enable the check outside a campaign is to arm an
+  // escalation that is a LibAFL command -- an invalid opcode anywhere else -- so a
+  // plain boot dies on the first report instead of scoring the rest.
+  //
+  if ((mAsanInfo == NULL) || (Size == 0) ||
+      (mAsanInfo->AsanProtectedRegionCount == 0))
+  {
+    return NULL;
+  }
+
+  if ((mAsanInfo->AsanRegionChecksActive == 0) && !AsanFuzzingWindowOpen ()) {
+    return NULL;
+  }
+
+  Last = Address + Size - 1;
+  for (Index = 0; Index < mAsanInfo->AsanProtectedRegionCount; Index++) {
+    if ((Last >= mAsanInfo->AsanProtectedRegionBase[Index]) &&
+        (Address <= mAsanInfo->AsanProtectedRegionEnd[Index]))
+    {
+      return "a region this driver does not own";
+    }
+  }
+
+  return NULL;
+}
+
 void AsanSignalSolution (VOID)
 {
 #if ASAN_FUZZER_BACKEND == ASAN_FUZZER_LIBAFL_QEMU
