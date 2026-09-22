@@ -26,6 +26,14 @@
 #define kAsanInitializationOrderMagic  0xf6
 #define kAsanUserPoisonedMemoryMagic  0xf7
 #define kAsanContiguousContainerOOBMagic  0xfc
+//
+// A protocol interface whose protocol has been uninstalled. The storage is still
+// allocated and still readable, so nothing else describes it: the lifetime that ended
+// is the protocol's, not the allocation's. Distinct from the free magic because a
+// caller holding a stale interface and a caller holding freed memory are different
+// mistakes with different fixes.
+//
+#define kAsanStaleInterfaceMagic  0xfb
 #define kAsanStackUseAfterScopeMagic  0xf8
 #define kAsanGlobalRedzoneMagic  0xf9
 #define kAsanInternalHeapMagic  0xfe
@@ -112,6 +120,19 @@ AsanRegisterProtectedRegion (
   IN UINT64       Base,
   IN UINT64       Size,
   IN CONST CHAR8  *Name
+  );
+
+//
+// Poison a pool allocation because the protocol it carried has been uninstalled. The
+// extent comes from the shadow -- the allocator poisons a right redzone at the end of
+// every allocation, so walking forward from the pointer finds it -- which means no
+// caller has to know how large the interface was. Returns the number of bytes poisoned,
+// or 0 when the pointer is not a bounded heap object: a protocol whose interface is a
+// global has no redzone to find and must be left alone.
+//
+UINTN
+AsanPoisonStaleInterface (
+  IN VOID  *Interface
   );
 
 VOID

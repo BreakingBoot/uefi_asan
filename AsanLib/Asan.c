@@ -254,6 +254,100 @@ STATIC BOOLEAN                mRegionChecksActive   = FALSE;
 // escalation is a LibAFL command -- an invalid opcode anywhere else, so a plain boot
 // dies on the first report instead of scoring the rest.
 //
+//
+// Defined further down; declared here because the stale-interface poison is above
+// it and C does not take kindly to the alternative.
+//
+void FastPoisonShadow (UINTN aligned_beg, UINTN aligned_size, UINT8 value);
+
+//
+// How far a pool allocation reaches, read out of the shadow rather than out of the
+// allocator. CoreAllocatePoolI poisons a right redzone at Data + OriSize, so walking
+// the shadow forward from the pointer finds the end without this needing to know what
+// a POOL_HEAD looks like -- DxeCore internals are not something a sanitizer should be
+// reaching into.
+//
+// 0 for anything that is not a bounded heap object: a global, a stack address, or a
+// pointer whose shadow is not mapped. Those have no redzone to stop at, and walking
+// until something happened to look like one is how a poison lands on memory that was
+// never ours.
+//
+STATIC
+UINTN
+AsanHeapExtent (
+  IN UINTN  Addr
+  )
+{
+  UINTN  Shadow;
+  UINTN  Bytes;
+  UINT8  Value;
+
+  if ((Addr == 0) || ((Addr & (SHADOW_GRANULARITY - 1)) != 0)) {
+    return 0;
+  }
+
+  Shadow = MEM_TO_SHADOW (Addr);
+  if ((Shadow < mAsanShadowMemoryStart) ||
+      (Shadow >= (mAsanShadowMemoryStart + mAsanShadowMemorySize)))
+  {
+    return 0;
+  }
+
+  //
+  // 0 means the whole granule is addressable, 1..7 means that many bytes are and the
+  // rest is redzone, anything else is a redzone or a poison of some kind. The cap is a
+  // guard against a shadow that is addressable as far as the eye can see, which is what
+  // a stack or a global looks like from here.
+  //
+  Bytes = 0;
+  while (Bytes < SIZE_1MB) {
+    Value = *(volatile UINT8 *)(UINTN)(Shadow + (Bytes / SHADOW_GRANULARITY));
+    if (Value == 0) {
+      Bytes += SHADOW_GRANULARITY;
+      continue;
+    }
+
+    if (Value < SHADOW_GRANULARITY) {
+      return Bytes + Value;
+    }
+
+    return Bytes;
+  }
+
+  return 0;
+}
+
+UINTN
+AsanPoisonStaleInterface (
+  IN VOID  *Interface
+  )
+{
+  UINTN  Extent;
+  UINTN  Aligned;
+
+  if (Interface == NULL) {
+    return 0;
+  }
+
+  Extent = AsanHeapExtent ((UINTN)Interface);
+  if (Extent == 0) {
+    return 0;
+  }
+
+  //
+  // Down, not up. Rounding the extent up would poison the redzone past the end, and the
+  // allocator owns that: it is what tells an overflow from a stale read, and writing
+  // over it loses the distinction for every later report.
+  //
+  Aligned = Extent & ~((UINTN)SHADOW_GRANULARITY - 1);
+  if (Aligned == 0) {
+    return 0;
+  }
+
+  FastPoisonShadow ((UINTN)Interface, Aligned, kAsanStaleInterfaceMagic);
+  return Aligned;
+}
+
 VOID
 AsanSetRegionChecks (
   IN BOOLEAN  Active
