@@ -255,6 +255,78 @@ STATIC BOOLEAN                mRegionChecksActive   = FALSE;
 // dies on the first report instead of scoring the rest.
 //
 //
+// Both defined further down. The untrusted-read check sits above them because the
+// load macro that calls it is compiled before either.
+//
+void AsanSignalSolution (VOID);
+
+//
+// Memory something outside the firmware can still change while a call is running.
+// Register it around a call, and a second read of a word already read during that call
+// is a double fetch: whatever the first read validated is not necessarily what the
+// second one used.
+//
+VOID
+AsanRegisterUntrusted (
+  IN UINT64  Base,
+  IN UINT64  Size
+  )
+{
+  if (mAsanInfo == NULL) {
+    return;
+  }
+
+  mAsanInfo->AsanUntrustedBase      = Base;
+  mAsanInfo->AsanUntrustedEnd       = (Size == 0) ? 0 : (Base + Size - 1);
+  mAsanInfo->AsanUntrustedSeenCount = 0;
+}
+
+//
+// Called from the load path, so the cheap answer has to come first: with no buffer
+// registered this is one load and a branch, which is what every instrumented read in
+// the firmware pays.
+//
+VOID
+AsanNoteUntrustedRead (
+  IN UINTN  Addr,
+  IN UINTN  Size
+  )
+{
+  UINT32  Index;
+  UINT64  Word;
+
+  if ((mAsanInfo == NULL) || (mAsanInfo->AsanUntrustedEnd == 0)) {
+    return;
+  }
+
+  if ((Addr < mAsanInfo->AsanUntrustedBase) ||
+      ((Addr + Size - 1) > mAsanInfo->AsanUntrustedEnd))
+  {
+    return;
+  }
+
+  //
+  // By granule, not by exact address. A length read as four bytes and then again as
+  // eight, or at a one-byte offset, is the same fetch of the same word and should not
+  // escape by changing its shape.
+  //
+  Word = (UINT64)Addr & ~((UINT64)SHADOW_GRANULARITY - 1);
+
+  for (Index = 0; Index < mAsanInfo->AsanUntrustedSeenCount; Index++) {
+    if (mAsanInfo->AsanUntrustedSeen[Index] == Word) {
+      SerialOutput ("FWSAN: double-fetch -- untrusted word read twice in one call\n");
+      AsanSignalSolution ();
+      return;
+    }
+  }
+
+  if (mAsanInfo->AsanUntrustedSeenCount < 8) {
+    mAsanInfo->AsanUntrustedSeen[mAsanInfo->AsanUntrustedSeenCount] = Word;
+    mAsanInfo->AsanUntrustedSeenCount++;
+  }
+}
+
+//
 // Defined further down; declared here because the stale-interface poison is above
 // it and C does not take kindly to the alternative.
 //
@@ -490,6 +562,13 @@ void ReportGenericError(UINTN addr, BOOLEAN is_write, UINTN access_size) {
 //        bug_type_score = 10;
         far_from_bounds = AdjacentShadowValuesAreFullyPoisoned(shadow_addr);
         break;
+      case kAsanStaleInterfaceMagic:
+        // The storage is alive; the protocol that lived in it is not. Saying
+        // "use-after-free" here would send someone looking for a FreePool that never
+        // happened.
+        bug_descr = "stale-protocol-interface";
+        if (!is_write) read_after_free_bonus = 18;
+        break;
       case kAsanHeapFreeMagic:
         bug_descr = "heap-use-after-free";
 //        bug_type_score = 20;
@@ -693,6 +772,10 @@ void __asan_load##size(UINTN addr)          \
 {                                                   \
   CHAR8 NumStr[19];                                 \
   if (asan_inited && !asan_is_deactivated){         \
+    /* a double fetch reads memory that is perfectly valid, so this cannot   */ \
+    /* hang off the poisoned-shadow test below; with nothing registered it   */ \
+    /* is one load and a branch                                              */ \
+    AsanNoteUntrustedRead (addr, size);                                         \
     UINTN sp = MEM_TO_SHADOW(addr);                                                 \
     if(mAsanShadowMemoryStart <= sp && sp <= mAsanShadowMemoryEnd) {                \
       UINTN s = size <= SHADOW_GRANULARITY ? *(UINT8 *)(sp)                         \

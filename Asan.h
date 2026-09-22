@@ -130,6 +130,24 @@ AsanRegisterProtectedRegion (
 // or 0 when the pointer is not a bounded heap object: a protocol whose interface is a
 // global has no redzone to find and must be left alone.
 //
+//
+// Memory something outside the firmware can still change while a call is running.
+// Register it around the call; a second read of a word already read during that call
+// is a double fetch, and what the first read validated is not what the second used.
+// Registering a size of 0 closes the window.
+//
+VOID
+AsanRegisterUntrusted (
+  IN UINT64  Base,
+  IN UINT64  Size
+  );
+
+VOID
+AsanNoteUntrustedRead (
+  IN UINTN  Addr,
+  IN UINTN  Size
+  );
+
 UINTN
 AsanPoisonStaleInterface (
   IN VOID  *Interface

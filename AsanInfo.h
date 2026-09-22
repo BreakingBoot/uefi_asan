@@ -48,6 +48,24 @@ typedef struct {
   UINT32       AsanProtectedRegionCount;
   UINT64       AsanProtectedRegionBase[8];
   UINT64       AsanProtectedRegionEnd[8];
+  //
+  // One buffer whose contents something outside the firmware can still change while a
+  // call is running -- a communication buffer, a queue, or the buffer a fuzzer just
+  // filled and handed to a protocol. Reading a length out of it, checking the length,
+  // and then reading it again to use it means the value that passed the check is not
+  // necessarily the value that acts.
+  //
+  // Shared, because the module that registers the buffer and the module that reads it
+  // are never the same one. Seen[] is the addresses already read during this call; a
+  // second read of one of them is the fault. Eight is enough -- a member that fetches
+  // more than eight distinct words out of untrusted memory has a bigger problem than
+  // this check.
+  //
+  UINT64       AsanUntrustedBase;
+  UINT64       AsanUntrustedEnd;
+  UINT32       AsanUntrustedSeenCount;
+  UINT32       AsanUntrustedReserved;
+  UINT64       AsanUntrustedSeen[8];
 } ASAN_INFO;
 
 extern EFI_GUID gAsanInfoGuid;
