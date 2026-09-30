@@ -61,10 +61,14 @@ typedef struct {
   // more than eight distinct words out of untrusted memory has a bigger problem than
   // this check.
   //
-  UINT64       AsanUntrustedBase;
-  UINT64       AsanUntrustedEnd;
+  // Four, not one. A harness hands several buffers to a single call and any of them can
+  // be the one a driver reads twice, so registering the next would have discarded the
+  // last and the check would only ever watch whichever argument happened to be built
+  // most recently.
+  UINT32       AsanUntrustedCount;
   UINT32       AsanUntrustedSeenCount;
-  UINT32       AsanUntrustedReserved;
+  UINT64       AsanUntrustedBase[4];
+  UINT64       AsanUntrustedEnd[4];
   UINT64       AsanUntrustedSeen[8];
 } ASAN_INFO;
 

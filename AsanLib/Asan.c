@@ -276,8 +276,24 @@ AsanRegisterUntrusted (
     return;
   }
 
-  mAsanInfo->AsanUntrustedBase      = Base;
-  mAsanInfo->AsanUntrustedEnd       = (Size == 0) ? 0 : (Base + Size - 1);
+  //
+  // Size 0 closes the window and forgets everything; anything else appends. A harness
+  // registers each buffer it built and then closes once, which is why this appends
+  // rather than replaces.
+  //
+  if (Size == 0) {
+    mAsanInfo->AsanUntrustedCount     = 0;
+    mAsanInfo->AsanUntrustedSeenCount = 0;
+    return;
+  }
+
+  if (mAsanInfo->AsanUntrustedCount >= 4) {
+    return;
+  }
+
+  mAsanInfo->AsanUntrustedBase[mAsanInfo->AsanUntrustedCount] = Base;
+  mAsanInfo->AsanUntrustedEnd[mAsanInfo->AsanUntrustedCount]  = Base + Size - 1;
+  mAsanInfo->AsanUntrustedCount++;
   mAsanInfo->AsanUntrustedSeenCount = 0;
 }
 
@@ -292,16 +308,25 @@ AsanNoteUntrustedRead (
   IN UINTN  Size
   )
 {
-  UINT32  Index;
-  UINT64  Word;
+  UINT32   Index;
+  UINT64   Word;
+  BOOLEAN  Inside;
 
-  if ((mAsanInfo == NULL) || (mAsanInfo->AsanUntrustedEnd == 0)) {
+  if ((mAsanInfo == NULL) || (mAsanInfo->AsanUntrustedCount == 0)) {
     return;
   }
 
-  if ((Addr < mAsanInfo->AsanUntrustedBase) ||
-      ((Addr + Size - 1) > mAsanInfo->AsanUntrustedEnd))
-  {
+  Inside = FALSE;
+  for (Index = 0; Index < mAsanInfo->AsanUntrustedCount; Index++) {
+    if ((Addr >= mAsanInfo->AsanUntrustedBase[Index]) &&
+        ((Addr + Size - 1) <= mAsanInfo->AsanUntrustedEnd[Index]))
+    {
+      Inside = TRUE;
+      break;
+    }
+  }
+
+  if (!Inside) {
     return;
   }
 
