@@ -792,6 +792,37 @@ void AsanSignalSolution (VOID);
 // stop intentionally when memory check fails, because I more hope to trace the call 
 // stack details info.
 // 
+//
+// Is the granule holding Addr poisoned at Addr's offset? Upstream's definition: a shadow
+// byte s means the first s bytes of that granule are addressable and the rest are not, and
+// a magic byte is >= 0x80, which as INT8 is negative and therefore poisons every offset.
+//
+// This exists because the checks below read exactly ONE shadow byte -- the one for the
+// FIRST byte of the access -- and short-circuit on "if (s)". An access whose first granule
+// is fully addressable and whose tail crosses into a poisoned one is therefore missed:
+// AllocatePool(9) leaves granule 0 at shadow 0 and granule 1 at shadow 1, so a 4 byte read
+// at Data+7 touches Data+9 and Data+10 out of bounds and reports nothing. Upstream closes
+// this by testing the LAST byte of the access as well, which is what the callers now do.
+//
+STATIC
+BOOLEAN
+AsanLastByteBad (
+  IN UINTN  Addr
+  )
+{
+  UINTN  Shadow;
+  UINT8  Value;
+
+  Shadow = MEM_TO_SHADOW (Addr);
+  if ((Shadow < mAsanShadowMemoryStart) || (Shadow > mAsanShadowMemoryEnd)) {
+    return FALSE;
+  }
+
+  Value = *(UINT8 *)Shadow;
+  return (BOOLEAN)((Value != 0) &&
+                   ((INT8)(Addr & (SHADOW_GRANULARITY - 1)) >= (INT8)Value));
+}
+
 #define DEFINE_ASAN_LOAD(size)                      \
 void __asan_load##size(UINTN addr)          \
 {                                                   \
@@ -805,7 +836,10 @@ void __asan_load##size(UINTN addr)          \
     if(mAsanShadowMemoryStart <= sp && sp <= mAsanShadowMemoryEnd) {                \
       UINTN s = size <= SHADOW_GRANULARITY ? *(UINT8 *)(sp)                         \
                                           : *(UINT16 *)(sp);                        \
-      if (s) {                                                                      \
+      /* s == 0 with a poisoned last byte falls through to the test below,   */ \
+      /* which compares against (INT8)0 and is therefore true -- so entry    */ \
+      /* here is what decides, and entry requires a real out-of-bounds byte. */ \
+      if (s || AsanLastByteBad (addr + size - 1)) {                                                                      \
         if ((size >= SHADOW_GRANULARITY) || (                                       \
                      ((INT8)((addr & (SHADOW_GRANULARITY - 1)) + size - 1)) >=      \
                          (INT8)s)) {                                                \
@@ -849,7 +883,10 @@ void __asan_store##size(UINTN addr)         \
     if(mAsanShadowMemoryStart <= sp && sp <= mAsanShadowMemoryEnd) {                \
       UINTN s = size <= SHADOW_GRANULARITY ? *(UINT8 *)(sp)                         \
                                           : *(UINT16 *)(sp);                        \
-      if (s) {                                                                      \
+      /* s == 0 with a poisoned last byte falls through to the test below,   */ \
+      /* which compares against (INT8)0 and is therefore true -- so entry    */ \
+      /* here is what decides, and entry requires a real out-of-bounds byte. */ \
+      if (s || AsanLastByteBad (addr + size - 1)) {                                                                      \
         if ((size >= SHADOW_GRANULARITY) || (                                       \
                      ((INT8)((addr & (SHADOW_GRANULARITY - 1)) + size - 1)) >=      \
                          (INT8)s)) {                                                \
@@ -891,7 +928,10 @@ void __asan_load##size##_noabort(UINTN addr)  \
     if(mAsanShadowMemoryStart <= sp && sp <= mAsanShadowMemoryEnd) {                \
       UINTN s = size <= SHADOW_GRANULARITY ? *(UINT8 *)(sp)                         \
                                           : *(UINT16 *)(sp);                        \
-      if (s) {                                                                      \
+      /* s == 0 with a poisoned last byte falls through to the test below,   */ \
+      /* which compares against (INT8)0 and is therefore true -- so entry    */ \
+      /* here is what decides, and entry requires a real out-of-bounds byte. */ \
+      if (s || AsanLastByteBad (addr + size - 1)) {                                                                      \
         if ((size >= SHADOW_GRANULARITY) || (                                       \
                      ((INT8)((addr & (SHADOW_GRANULARITY - 1)) + size - 1)) >=      \
                          (INT8)s)) {                                                \
@@ -935,7 +975,10 @@ void __asan_store##size##_noabort(UINTN addr)   \
     if(mAsanShadowMemoryStart <= sp && sp <= mAsanShadowMemoryEnd) {                \
       UINTN s = size <= SHADOW_GRANULARITY ? *(UINT8 *)(sp)                         \
                                           : *(UINT16 *)(sp);                        \
-      if (s) {                                                                      \
+      /* s == 0 with a poisoned last byte falls through to the test below,   */ \
+      /* which compares against (INT8)0 and is therefore true -- so entry    */ \
+      /* here is what decides, and entry requires a real out-of-bounds byte. */ \
+      if (s || AsanLastByteBad (addr + size - 1)) {                                                                      \
         if ((size >= SHADOW_GRANULARITY) || (                                       \
                      ((INT8)((addr & (SHADOW_GRANULARITY - 1)) + size - 1)) >=      \
                          (INT8)s)) {                                                \
@@ -1082,7 +1125,7 @@ void __asan_loadN_noabort(UINTN addr, UINTN size)
     }
     UINTN s = size <= SHADOW_GRANULARITY ? *(UINT8 *)(sp): *(UINT16 *)(sp);
     Num2Str8bit ( size , NumStr);
-    SerialOutput ("__asan_storeN_noabort");
+    SerialOutput ("__asan_loadN_noabort");
     SerialOutput (NumStr);
     SerialOutput (" is called\n");
     SerialOutput ("Return IP address is ");
