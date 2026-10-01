@@ -277,6 +277,33 @@ STATIC BOOLEAN                mRegionChecksActive   = FALSE;
 void AsanSignalSolution (VOID);
 
 //
+// Forward declared for the same reason AsanSignalSolution above is: the firmware checks that
+// call these sit earlier in the file than the definitions, and under -Werror an implicit
+// declaration is an error, not a warning -- and because the implicit one is assumed
+// non-static it also makes the real static definition "a static declaration following a
+// non-static declaration".
+//
+STATIC
+VOID
+AsanEmitReport (
+  IN CONST CHAR8  *bug_descr,
+  IN UINTN        addr,
+  IN UINTN        size,
+  IN UINTN        is_write,
+  IN UINTN        ip,
+  IN CONST CHAR8  *where
+  );
+
+VOID
+AsanReportFirmwareClass (
+  IN CONST CHAR8  *BugDescr,
+  IN UINTN        Addr,
+  IN UINTN        Size,
+  IN UINTN        IsWrite,
+  IN UINTN        Ip
+  );
+
+//
 // Memory something outside the firmware can still change while a call is running.
 // Register it around a call, and a second read of a word already read during that call
 // is a double fetch: whatever the first read validated is not necessarily what the
@@ -356,6 +383,8 @@ AsanNoteUntrustedRead (
   for (Index = 0; Index < mAsanInfo->AsanUntrustedSeenCount; Index++) {
     if (mAsanInfo->AsanUntrustedSeen[Index] == Word) {
       SerialOutput ("FWSAN: double-fetch -- untrusted word read twice in one call\n");
+      AsanReportFirmwareClass ("double-fetch", Addr, Size, 0,
+                               (UINTN)__builtin_return_address (0));
       AsanSignalSolution ();
       return;
     }
@@ -875,26 +904,8 @@ AsanReportOutline (
       break;
   }
 
-  SerialOutput ("[ASan] ===================================================\n");
-  SerialOutput ("[ASan] ERROR: Invalid memory access: address ");
-  Num2Str64bit (addr, NumStr);
-  SerialOutput (NumStr);
-  SerialOutput (", size ");
-  Num2Str64bit (size, NumStr);
-  SerialOutput (NumStr);
-  SerialOutput (", is_write ");
-  Num2Str64bit (is_write, NumStr);
-  SerialOutput (NumStr);
-  SerialOutput (", ip ");
-  Num2Str64bit (ip, NumStr);
-  SerialOutput (NumStr);
-  SerialOutput ("\n");
-  SerialOutput ("bug_descr=");
-  SerialOutput (bug_descr);
-  SerialOutput (" in file: asan-outline-instrumentation at line: ");
-  Num2Str64bit (ip, NumStr);
-  SerialOutput (NumStr);
-  SerialOutput ("\n");
+  AsanEmitReport (bug_descr, addr, size, is_write, ip,
+                  "asan-outline-instrumentation");
   SerialOutput ("[ASan] shadow ");
   Num2Str64bit (sp, NumStr);
   SerialOutput (NumStr);
@@ -933,6 +944,108 @@ AsanLastByteBad (
   Value = *(UINT8 *)Shadow;
   return (BOOLEAN)((Value != 0) &&
                    ((INT8)(Addr & (SHADOW_GRANULARITY - 1)) >= (INT8)Value));
+}
+
+//
+// The two lines scripts/firness.py turns into a crashes.csv row. It wants, in order, an
+// "[ASan] ERROR: ... ip 0x..." line for the address and a
+// "bug_descr=<class> in file: <path> at line: <n>" line for the class -- that pair and
+// nothing else. FWSAN's own reports said neither, so 3283 double-fetch detections in one
+// campaign produced zero report rows and bugs.md said the firmware sanitizer had found
+// nothing. Only stale-interface ever came through, and only because an ASan load rides
+// along with it.
+//
+// File is a marker rather than a path because an outline handler has no source position;
+// the ip is what triage attributes a module from, and bug_report.py groups by it.
+//
+STATIC
+VOID
+AsanEmitReport (
+  IN CONST CHAR8  *bug_descr,
+  IN UINTN        addr,
+  IN UINTN        size,
+  IN UINTN        is_write,
+  IN UINTN        ip,
+  IN CONST CHAR8  *where
+  )
+{
+  CHAR8  NumStr[19];
+
+  SerialOutput ("[ASan] ===================================================\n");
+  SerialOutput ("[ASan] ERROR: Invalid memory access: address ");
+  Num2Str64bit (addr, NumStr);
+  SerialOutput (NumStr);
+  SerialOutput (", size ");
+  Num2Str64bit (size, NumStr);
+  SerialOutput (NumStr);
+  SerialOutput (", is_write ");
+  Num2Str64bit (is_write, NumStr);
+  SerialOutput (NumStr);
+  SerialOutput (", ip ");
+  Num2Str64bit (ip, NumStr);
+  SerialOutput (NumStr);
+  SerialOutput ("\n");
+  SerialOutput ("bug_descr=");
+  SerialOutput (bug_descr);
+  SerialOutput (" in file: ");
+  SerialOutput (where);
+  SerialOutput (" at line: ");
+  Num2Str64bit (ip, NumStr);
+  SerialOutput (NumStr);
+  SerialOutput ("\n");
+}
+
+//
+// What a firmware-specific check calls once it has decided. Deduped by return IP for the
+// same reason the outline handlers are: a single site can carry tens of thousands of hits.
+//
+VOID
+AsanReportFirmwareClass (
+  IN CONST CHAR8  *BugDescr,
+  IN UINTN        Addr,
+  IN UINTN        Size,
+  IN UINTN        IsWrite,
+  IN UINTN        Ip
+  )
+{
+  UINTN        Index;
+  UINTN        Length;
+  CONST CHAR8  *Cursor;
+  CHAR8        Class[48];
+
+  if (!asan_inited || asan_is_deactivated) {
+    return;
+  }
+
+  for (Index = 0; Index < mOutlineSeenCount; Index++) {
+    if (mOutlineSeenIp[Index] == Ip) {
+      return;
+    }
+  }
+
+  if (mOutlineSeenCount >= ASAN_OUTLINE_IP_SEEN) {
+    return;
+  }
+
+  mOutlineSeenIp[mOutlineSeenCount++] = Ip;
+
+  //
+  // The "fwsan-" prefix is applied here rather than by each caller, so every class that
+  // comes through a firmware-specific check is identifiable as one in triage however it was
+  // reported, and a caller cannot forget it. Copied by hand because AsanLib has no
+  // AsciiSPrint and this is the whole of what is needed.
+  //
+  Length = 0;
+  for (Cursor = "fwsan-"; (*Cursor != '\0') && (Length < sizeof (Class) - 1); Cursor++) {
+    Class[Length++] = *Cursor;
+  }
+
+  for (Cursor = BugDescr; (*Cursor != '\0') && (Length < sizeof (Class) - 1); Cursor++) {
+    Class[Length++] = *Cursor;
+  }
+
+  Class[Length] = '\0';
+  AsanEmitReport (Class, Addr, Size, IsWrite, Ip, "fwsan");
 }
 
 #define DEFINE_ASAN_LOAD(size)                      \
