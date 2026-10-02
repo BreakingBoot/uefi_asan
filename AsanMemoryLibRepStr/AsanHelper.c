@@ -444,6 +444,23 @@ void asan_bug_report(UINTN addr, UINTN size,
   AsanSignalSolution ();
 }
 
+//
+// Weak, and a DEFINITION rather than a declaration: an undefined weak leaves a relocation
+// GenFw rejects outright. AsanLib's strong one wins wherever it is linked, which is every
+// instrumented module.
+//
+__attribute__ ((weak))
+VOID
+AsanReportFirmwareClass (
+  IN CONST CHAR8  *BugDescr,
+  IN UINTN        Addr,
+  IN UINTN        Size,
+  IN UINTN        IsWrite,
+  IN UINTN        Ip
+  )
+{
+}
+
 static inline int asan_check_memory(UINTN addr, UINTN size,
                                      BOOLEAN write, UINTN pc, CHAR8 *file, UINTN line) {
   int buggy_shadow_address;
@@ -460,6 +477,7 @@ static inline int asan_check_memory(UINTN addr, UINTN size,
     SerialOutput ("FWSAN: foreign-region access -- ");
     SerialOutput (region);
     SerialOutput ("\n");
+    AsanReportFirmwareClass ("foreign-region", addr, size, (UINTN)write, pc);
     // No shadow dump. There is no shadow for flash or MMIO -- that is the whole reason
     // this check exists -- and asking asan_print_shadow_memory to render one walks tens
     // of thousands of bytes of unmapped shadow, which is both meaningless and slow
