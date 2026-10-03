@@ -145,7 +145,8 @@ AsanRegisterUntrusted (
 VOID
 AsanNoteUntrustedRead (
   IN UINTN  Addr,
-  IN UINTN  Size
+  IN UINTN  Size,
+  IN UINTN  Ip
   );
 
 UINTN

@@ -348,7 +348,8 @@ AsanRegisterUntrusted (
 VOID
 AsanNoteUntrustedRead (
   IN UINTN  Addr,
-  IN UINTN  Size
+  IN UINTN  Size,
+  IN UINTN  Ip
   )
 {
   UINT32   Index;
@@ -383,8 +384,12 @@ AsanNoteUntrustedRead (
   for (Index = 0; Index < mAsanInfo->AsanUntrustedSeenCount; Index++) {
     if (mAsanInfo->AsanUntrustedSeen[Index] == Word) {
       SerialOutput ("FWSAN: double-fetch -- untrusted word read twice in one call\n");
-      AsanReportFirmwareClass ("double-fetch", Addr, Size, 0,
-                               (UINTN)__builtin_return_address (0));
+      //
+      // The caller's Ip, passed down from the access macro. Computing it here gives the
+      // return address inside __asan_loadN -- the handler -- so every double-fetch report
+      // symbolised to AsanLib instead of the firmware line that did the read.
+      //
+      AsanReportFirmwareClass ("double-fetch", Addr, Size, 0, Ip);
       AsanSignalSolution ();
       return;
     }
@@ -1056,7 +1061,7 @@ void __asan_load##size(UINTN addr)          \
     /* a double fetch reads memory that is perfectly valid, so this cannot   */ \
     /* hang off the poisoned-shadow test below; with nothing registered it   */ \
     /* is one load and a branch                                              */ \
-    AsanNoteUntrustedRead (addr, size);                                         \
+    AsanNoteUntrustedRead (addr, size, (UINTN)__builtin_return_address (0));                                         \
     UINTN sp = MEM_TO_SHADOW(addr);                                                 \
     if(mAsanShadowMemoryStart <= sp && sp <= mAsanShadowMemoryEnd) {                \
       UINTN s = size <= SHADOW_GRANULARITY ? *(UINT8 *)(sp)                         \
