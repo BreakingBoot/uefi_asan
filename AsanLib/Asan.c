@@ -1061,7 +1061,15 @@ void __asan_load##size(UINTN addr)          \
     /* a double fetch reads memory that is perfectly valid, so this cannot   */ \
     /* hang off the poisoned-shadow test below; with nothing registered it   */ \
     /* is one load and a branch                                              */ \
-    AsanNoteUntrustedRead (addr, size, (UINTN)__builtin_return_address (0));                                         \
+    /* Guarded, because the argument is not free. __builtin_return_address(0) was    */ \
+    /* being evaluated on EVERY instrumented load rather than only in the failure     */ \
+    /* branch, and the boot slowed so far it no longer reached BDS inside 2400s --    */ \
+    /* it was still enumerating ATA. The guard is the same two loads and a branch     */ \
+    /* AsanNoteUntrustedRead did on entry, so the fast path is what it was, and the   */ \
+    /* ip is computed only while an untrusted window is actually open.                */ \
+    if ((mAsanInfo != NULL) && (mAsanInfo->AsanUntrustedCount != 0)) {                  \
+      AsanNoteUntrustedRead (addr, size, (UINTN)__builtin_return_address (0));          \
+    }                                         \
     UINTN sp = MEM_TO_SHADOW(addr);                                                 \
     if(mAsanShadowMemoryStart <= sp && sp <= mAsanShadowMemoryEnd) {                \
       UINTN s = size <= SHADOW_GRANULARITY ? *(UINT8 *)(sp)                         \
