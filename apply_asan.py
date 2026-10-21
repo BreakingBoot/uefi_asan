@@ -699,14 +699,23 @@ def main():
             if found.returncode == 0 and found.stdout.strip():
                 base = found.stdout.strip()
                 break
-    if not base and git(src, 'rev-parse', '--verify',
-                        f'{PORT_BASE}^{{commit}}').returncode == 0:
+    if not base:
         # Which commit the integration sits on is a fact about the integration, not
         # something the caller should have to know. Deriving it needs both histories, and
-        # a reference checkout fetched with --depth=1 does not have them -- merge-base
-        # then finds nothing and the tool asks for a --base the caller has no way to work
-        # out.
-        base = PORT_BASE
+        # a reference checkout fetched with --depth=1 does not have them -- no tags, and
+        # merge-base finds nothing across a shallow boundary -- so the tool asked for a
+        # --base the caller had no way to work out. That is the normal state in CI, where
+        # the submodules come down shallow: every run failed here with "cannot find the
+        # port base" and no counts, which reads as the port not applying.
+        #
+        # The port is a comparison of two trees, not a replay of history, so the base
+        # object on its own is enough -- its ancestry is never walked. Ask the remote for
+        # it by name when it is missing; git diff then works straight across the shallow
+        # boundary.
+        if git(src, 'rev-parse', '--verify', f'{PORT_BASE}^{{commit}}').returncode:
+            git(src, 'fetch', '--depth=1', 'origin', PORT_BASE)
+        if git(src, 'rev-parse', '--verify', f'{PORT_BASE}^{{commit}}').returncode == 0:
+            base = PORT_BASE
     if not base:
         print('cannot find the port base; pass --base', file=sys.stderr)
         return 2
