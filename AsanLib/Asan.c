@@ -867,6 +867,7 @@ AsanReportOutline (
   CHAR8       NumStr[19];
   CONST CHAR8 *bug_descr = "unknown-crash";
   UINTN       Index;
+  UINTN       LastShadow;
 
   for (Index = 0; Index < mOutlineSeenCount; Index++) {
     if (mOutlineSeenIp[Index] == ip) {
@@ -883,6 +884,23 @@ AsanReportOutline (
     return;
   }
   mOutlineSeenIp[mOutlineSeenCount++] = ip;
+
+  //
+  // A cross-granule overrun arrives here with s == 0. The load and store macros
+  // enter the report on "s || AsanLastByteBad (addr + size - 1)", so an access
+  // whose FIRST byte is addressable and whose LAST byte is not reaches this
+  // function carrying the first byte's clean shadow. The switch below has no arm
+  // for 0 and its default requires (s & 0xFF) > 0, so every such finding was
+  // emitted as "unknown-crash" -- the one access AsanLastByteBad was added to
+  // catch, AllocatePool (9) read four bytes at +7, could be detected and then not
+  // named. Classify on the byte that actually failed.
+  //
+  if (((s & 0xFF) == 0) && (size > 0)) {
+    LastShadow = MEM_TO_SHADOW (addr + size - 1);
+    if ((LastShadow >= mAsanShadowMemoryStart) && (LastShadow <= mAsanShadowMemoryEnd)) {
+      s = *(UINT8 *)LastShadow;
+    }
+  }
 
   switch (s & 0xFF) {
     case kAsanHeapLeftRedzoneMagic:      bug_descr = "heap-buffer-overflow";           break;
