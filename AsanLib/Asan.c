@@ -144,24 +144,37 @@ AsanFuzzingWindowOpen (
 }
 
 //
-// Armed at ReadyToBoot, or by a target that opens the window itself. Both are needed:
-// AsanLib is linked into every instrumented image and this flag is per image, so a
-// boot option -- which is loaded after ReadyToBoot has already been signalled -- never
-// sees that event and could otherwise never report. Measured: AsanSelfTest detected its
-// own overflow (9 reports against the control's 8) and the fuzzer recorded nothing.
+// There is no ReadyToBoot arming flag here any more, and the reason is worth keeping.
 //
-STATIC BOOLEAN  mAsanReportArmed = FALSE;
-
+// Reporting under libafl-qemu used to be gated twice: a per-image flag armed by a
+// ReadyToBoot event, and the fuzzing window below. The event was registered from
+// AsanLibConstructor, which runs in EVERY image that links AsanLib -- and the platform
+// dsc resolves this library for DXE_SMM_DRIVER and SMM_CORE as well, so SMM drivers
+// registered it too. Their notify function lives in SMRAM.
 //
-// The arming event, kept so the destructor can close it. A library constructor runs in
-// every module that links AsanLib, and several of those modules do not survive: a DXE
-// driver whose entry point returns an error is unloaded by the core, and OVMF has five
-// of them -- "Image at 0001D95B000 start failed: Unsupported" and friends. The event it
-// registered stays on the ReadyToBoot list with a notify function pointing into the
-// image that has just been freed, and when BDS signals the group the core calls it. The
-// boot then dies with #UD somewhere that is not code at all: in one run at the
-// EFI_GLOBAL_VARIABLE guid in BdsDxe's .data, whose first byte 0x61 is POPA and invalid
-// in 64-bit mode. 26 of the 90 registered notifications had run by then.
+// That is a call DXE cannot make. SMM IPL locks the SMRAM window during late DXE; when
+// BDS then signals ReadyToBoot, the core walks its notify list and calls a function
+// inside the locked aperture. Measured on the EVAL-1 tree, SMRAM 7F001000-7FFFFFFF and
+// the first fault at 7FC7D396, 885 debug lines after "SMM IPL locked SMRAM window":
+// #UD, and because CpuDxe's CommonExceptionHandlerWorker is itself instrumented the
+// handler faults again -- 1727 exceptions at one address and the guest is gone. With
+// FIRNESS_QEMU_CRASH the handler also signals the fuzzer, so under libafl-qemu that
+// becomes an END before the first START and the client wedges: the broker heartbeats
+// "executions: 0" forever while the guest never prints another line.
+//
+// It cost four campaigns and two probes to find, all six stopping at a byte-identical
+// point sixteen debug lines short of "[Bds]Booting", on SMM firmware only -- a non-SMM
+// build has no module whose code is in SMRAM, which is why this never showed up before.
+//
+// The gate is gone rather than conditioned, because it was redundant. Its stated job was
+// to stop an END before the first START, and the window gate below already does that:
+// OvmfPkg/PlatformPei/MemDetect.c sets AsanFuzzingActive = 0 when it builds the HOB, and
+// the only callers of AsanSetFuzzingActive are the generated harness -- which runs
+// HARNESS_START before it opens anything -- and AsanSelfTest, which brackets its own
+// cases. So nothing can report before START either way, and deleting this also retires
+// the dangling-notify hazard the event always carried: a DXE driver whose entry point
+// returns an error is unloaded, and OVMF has five of them, leaving a notify pointing
+// into a freed image.
 //
 STATIC BOOLEAN  mAsanFuzzingAnnounced = FALSE;
 
@@ -178,7 +191,6 @@ AsanSetFuzzingActive (
     mAsanInfo->AsanFuzzingActive = Active ? 1 : 0;
   }
   if (Active) {
-    mAsanReportArmed = TRUE;
     if (!mAsanFuzzingAnnounced) {
       mAsanFuzzingAnnounced = TRUE;
       //
@@ -220,34 +232,17 @@ AsanSetFuzzingActive (
 #endif
 
 //
-// Reporting under libafl-qemu is gated twice, and both gates are load-bearing.
+// Reporting under libafl-qemu is gated once, by the fuzzing window above.
 //
-// ReadyToBoot arms it, because LIBAFL_QEMU_COMMAND_END before the first START aborts
-// the whole run with EndBeforeStart, and this firmware raises hundreds of reports while
-// it boots.
+// It was gated twice. The first gate, a ReadyToBoot event, had to go: see the comment on
+// mAsanFuzzingAnnounced for what it did to SMM firmware. The window is the gate that was
+// ever load-bearing -- arming alone was tried first, on the reasoning that the harness is
+// a boot option so anything after ReadyToBoot belongs to an iteration, and that is false:
+// HiiDatabase exports its package lists between the two, and those findings ended every
+// iteration before the harness ran (measured 2026-09-09: objectives 5, executions 5,
+// corpus 0). A target that is not the generated harness -- AsanSelfTest, say -- opens the
+// window for itself, exactly as it does under TSFFS.
 //
-// Arming was once the only gate, on the reasoning that the harness is a boot option so
-// anything after ReadyToBoot belongs to an iteration. That is false: HiiDatabase exports
-// its package lists between the two, and those findings ended every iteration before the
-// harness ran. So the window opened by AsanSetFuzzingActive is required as well, exactly
-// as it is under TSFFS. A target that is not the generated harness -- AsanSelfTest, say --
-// has to open it for itself.
-//
-#if ASAN_FUZZER_BACKEND == ASAN_FUZZER_LIBAFL_QEMU
-
-STATIC EFI_EVENT  mAsanReadyToBootEvent = NULL;
-
-STATIC
-VOID
-EFIAPI
-AsanArmReporting (
-  IN EFI_EVENT  Event,
-  IN VOID       *Context
-  )
-{
-  mAsanReportArmed = TRUE;
-}
-#endif
 
 //
 // Regions a driver has no business touching. ASan describes allocations, so it has
@@ -580,14 +575,12 @@ void AsanSignalSolution (VOID)
   UINT64  Ret = 4;  // LIBAFL_QEMU_COMMAND_END
 
   //
-  // Both gates. Arming at ReadyToBoot alone is not enough: HiiDatabase exports its
-  // package lists after that event and before the boot option runs, so its UBSan
-  // findings ended five iterations out of five with the harness never reached
-  // (measured 2026-09-09, objectives 5, executions 5, corpus 0). The armed flag
-  // still matters on its own: an END before the first START aborts the run with
-  // EndBeforeStart.
+  // The window, and nothing else. An END before the first START aborts the run with
+  // EndBeforeStart, and this is what prevents one: the window is shut for the whole boot
+  // -- MemDetect.c builds the HOB with AsanFuzzingActive = 0 -- and the harness does not
+  // open it until after HARNESS_START.
   //
-  if (!mAsanReportArmed || !AsanFuzzingWindowOpen ()) {
+  if (!AsanFuzzingWindowOpen ()) {
     return;
   }
 
@@ -2428,11 +2421,9 @@ SetupAsanShadowMemory (
 
 
 //
-// Close the arming event when this module goes away.
-//
-// UefiDriverEntryPoint calls ProcessLibraryDestructorList when the module entry point
-// returns an error, which is exactly the case that leaves a dangling notification
-// behind, and the same list runs when a driver is unloaded for any other reason.
+// Kept, and deliberately empty. It existed to close the ReadyToBoot arming event, which
+// no longer exists; AsanLib.inf still names a DESTRUCTOR and removing the declaration
+// without the definition is a link error in every instrumented module.
 //
 RETURN_STATUS
 EFIAPI
@@ -2441,14 +2432,6 @@ AsanLibDestructor (
   IN EFI_SYSTEM_TABLE  *SystemTable
   )
 {
-#if ASAN_FUZZER_BACKEND == ASAN_FUZZER_LIBAFL_QEMU
-  if ((mAsanReadyToBootEvent != NULL) &&
-      (SystemTable != NULL) && (SystemTable->BootServices != NULL))
-  {
-    SystemTable->BootServices->CloseEvent (mAsanReadyToBootEvent);
-    mAsanReadyToBootEvent = NULL;
-  }
-#endif
   return RETURN_SUCCESS;
 }
 
@@ -2465,22 +2448,6 @@ AsanLibConstructor (
   int                           size;
   SerialOutput ("AsanLibConstructor begin\n");
   SerialOutput ("Get hob of gAsanInfoGuid\n");
-
-#if ASAN_FUZZER_BACKEND == ASAN_FUZZER_LIBAFL_QEMU
-  //
-  // DxeCore gets a NULL SystemTable here, so it never arms. That is the right outcome:
-  // an out of bounds access is reported by whoever makes it, and the drivers under test
-  // are the ones that do.
-  //
-  if ((SystemTable != NULL) && (SystemTable->BootServices != NULL)) {
-    if (!EFI_ERROR (SystemTable->BootServices->CreateEventEx (
-                      EVT_NOTIFY_SIGNAL, TPL_CALLBACK, AsanArmReporting,
-                      NULL, &gEfiEventReadyToBootGuid, &mAsanReadyToBootEvent)))
-    {
-      SerialOutput ("AsanLib: reporting arms at ReadyToBoot\n");
-    }
-  }
-#endif
 
   if (AsanCtorFlag) {
     return RETURN_SUCCESS;//Status;
