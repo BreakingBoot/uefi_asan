@@ -385,7 +385,31 @@ AsanNoteUntrustedRead (
       // symbolised to AsanLib instead of the firmware line that did the read.
       //
       AsanReportFirmwareClass ("double-fetch", Addr, Size, 0, Ip);
+      //
+      // Reported, but NOT escalated to a fuzzer solution unless asked for.
+      //
+      // Re-reading a comm-buffer field is what a well-written handler does: read a length
+      // to validate it, read it again to use it. It is only a bug when the attacker can
+      // change the value in between, which no campaign here can demonstrate. So this
+      // fires on essentially every well-formed SMI call -- and because LibAFL files an
+      // objective instead of adding the input to the corpus, every input became a
+      // solution and none became coverage. Measured on the EVAL-1 SMI target: 30 seeds in,
+      // 29 objectives, corpus 0, 30 executions in 39 minutes, every iteration ending
+      // "FWSAN: double-fetch" and nothing else. The campaign spent its whole budget
+      // re-confirming one benign pattern and never explored past the seeds.
+      //
+      // In-guest de-duplication cannot fix this: the snapshot restore rewinds guest
+      // memory between iterations, so AsanUntrustedSeen and any table beside it start
+      // empty every time. The decision has to be not to escalate.
+      //
+      // The finding is not lost. It still goes out on serial, so the capture, crashes.csv
+      // and the triage stage all see it exactly as before; what it no longer does is
+      // stop the fuzzer from exploring. Build with -D FWSAN_DOUBLE_FETCH_SOLUTION to get
+      // the old behaviour, which is worth it only when the saved input is the point.
+      //
+#ifdef FWSAN_DOUBLE_FETCH_SOLUTION
       AsanSignalSolution ();
+#endif
       return;
     }
   }
