@@ -453,6 +453,7 @@ __attribute__ ((weak))
 VOID
 AsanReportFirmwareClass (
   IN CONST CHAR8  *BugDescr,
+  IN CONST CHAR8  *Detail,
   IN UINTN        Addr,
   IN UINTN        Size,
   IN UINTN        IsWrite,
@@ -474,10 +475,12 @@ static inline int asan_check_memory(UINTN addr, UINTN size,
   // there is no poisoned byte to find -- and wrong for a reason the shadow cannot hold.
   region = AsanProtectedRegionName ((UINT64)addr, (UINT64)size);
   if (region != NULL) {
-    SerialOutput ("FWSAN: foreign-region access -- ");
-    SerialOutput (region);
-    SerialOutput ("\n");
-    AsanReportFirmwareClass ("foreign-region", addr, size, (UINTN)write, pc);
+    //
+    // The banner is not printed here. AsanReportFirmwareClass emits it once its own
+    // guards have passed, so a suppressed finding stays quiet instead of announcing a
+    // detection whose report never arrives -- see the note at the double-fetch call site.
+    //
+    AsanReportFirmwareClass ("foreign-region", region, addr, size, (UINTN)write, pc);
     // No shadow dump. There is no shadow for flash or MMIO -- that is the whole reason
     // this check exists -- and asking asan_print_shadow_memory to render one walks tens
     // of thousands of bytes of unmapped shadow, which is both meaningless and slow

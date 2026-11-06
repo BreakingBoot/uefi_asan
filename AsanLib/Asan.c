@@ -292,6 +292,7 @@ AsanEmitReport (
 VOID
 AsanReportFirmwareClass (
   IN CONST CHAR8  *BugDescr,
+  IN CONST CHAR8  *Detail,
   IN UINTN        Addr,
   IN UINTN        Size,
   IN UINTN        IsWrite,
@@ -378,13 +379,29 @@ AsanNoteUntrustedRead (
 
   for (Index = 0; Index < mAsanInfo->AsanUntrustedSeenCount; Index++) {
     if (mAsanInfo->AsanUntrustedSeen[Index] == Word) {
-      SerialOutput ("FWSAN: double-fetch -- untrusted word read twice in one call\n");
       //
       // The caller's Ip, passed down from the access macro. Computing it here gives the
       // return address inside __asan_loadN -- the handler -- so every double-fetch report
       // symbolised to AsanLib instead of the firmware line that did the read.
       //
-      AsanReportFirmwareClass ("double-fetch", Addr, Size, 0, Ip);
+      // The "FWSAN: double-fetch -- ..." banner used to be printed here, unconditionally,
+      // one line per detection and before the report was attempted. The two could then
+      // disagree, and on EVAL-1 run 42186976238 they did: 6403878 banners, 0 reports, 387
+      // MB of capture, and nothing a triage pass could key on. Worse, bench_cases.py
+      // scores a detection off the banner's " -- " form, so the benchmark passed while the
+      // reporting path was producing nothing. The banner now comes from inside
+      // AsanReportFirmwareClass, after its guards, so a detection that is suppressed is
+      // silent and a detection that is narrated is always accompanied by its address,
+      // size and ip.
+      //
+      AsanReportFirmwareClass (
+        "double-fetch",
+        "untrusted word read twice in one call",
+        Addr,
+        Size,
+        0,
+        Ip
+        );
       //
       // Reported, but NOT escalated to a fuzzer solution unless asked for.
       //
@@ -871,6 +888,91 @@ void AsanSignalSolution (VOID);
 STATIC UINTN  mOutlineSeenIp[ASAN_OUTLINE_IP_SEEN];
 STATIC UINTN  mOutlineSeenCount = 0;
 
+//
+// The firmware-specific classes get their own table rather than sharing the one above.
+//
+// Sharing it coupled two unrelated budgets: every generic outline report consumed a slot
+// a double fetch would later need, and once the 256 were gone BOTH families went silent
+// for the rest of the boot with nothing said about it. The classes are not interchangeable
+// -- a heap overflow is reported by the module that owns the bug, while a double fetch is
+// reported by whichever instrumented library happened to read the untrusted word twice, so
+// the fwsan family naturally touches far more distinct IPs and would always be the one
+// starved.
+//
+#define ASAN_FWSAN_IP_SEEN  256
+STATIC UINTN    mFwsanSeenIp[ASAN_FWSAN_IP_SEEN];
+STATIC UINTN    mFwsanSeenCount = 0;
+
+//
+// Why a firmware-class report did not come out, counted rather than printed.
+//
+// Measured on EVAL-1 run 42186976238: 6403878 "FWSAN: double-fetch" lines in the capture
+// and not one fwsan- report beside them, so 6.4 million detections produced nothing a
+// triage pass could key on, cluster or attribute. The detector looked like it was working
+// because the banner was loud, and looked like it had found nothing because the report was
+// silent, and neither half said the other was missing. These counters are what makes the
+// disagreement visible: AsanFwsanNote below prints them at powers of two, so a run that
+// detects and never reports says so in about twenty lines instead of staying quiet or
+// emitting one line per detection.
+//
+STATIC UINTN    mFwsanDetected = 0;
+STATIC UINTN    mFwsanReported = 0;
+STATIC UINTN    mFwsanSuppressedSeen = 0;
+STATIC UINTN    mFwsanSuppressedFull = 0;
+STATIC UINTN    mFwsanSuppressedOff = 0;
+
+//
+// TRUE once per power of two, so a counter that climbs into the millions is narrated in
+// log2(n) lines. Snapshot restore rewinds these counters with the rest of guest memory, so
+// the numbers are per iteration, which is the useful granularity: "this iteration detected
+// 64 and reported 0" is the statement that matters.
+//
+STATIC
+BOOLEAN
+AsanIsPowerOfTwo (
+  IN UINTN  Value
+  )
+{
+  return (BOOLEAN)((Value != 0) && ((Value & (Value - 1)) == 0));
+}
+
+//
+// Says that a firmware-class detection was swallowed, and why, without saying it every
+// time. One line at 1, 2, 4, 8 ... so a storm costs about twenty lines and a single
+// occurrence is still reported.
+//
+// The totals go out alongside the reason because the reason alone is not actionable: a
+// run where everything is "already-seen" after one report is working correctly, and a run
+// where everything is "already-seen" and the report count is zero is not, and only the
+// pair distinguishes them.
+//
+STATIC
+VOID
+AsanFwsanNote (
+  IN CONST CHAR8  *Reason,
+  IN UINTN        Count
+  )
+{
+  CHAR8  NumStr[19];
+
+  if (!AsanIsPowerOfTwo (Count)) {
+    return;
+  }
+
+  SerialOutput ("FWSAN: suppressed (");
+  SerialOutput (Reason);
+  SerialOutput (") x");
+  Num2Str64bit (Count, NumStr);
+  SerialOutput (NumStr);
+  SerialOutput (" -- detected ");
+  Num2Str64bit (mFwsanDetected, NumStr);
+  SerialOutput (NumStr);
+  SerialOutput (", reported ");
+  Num2Str64bit (mFwsanReported, NumStr);
+  SerialOutput (NumStr);
+  SerialOutput ("\n");
+}
+
 VOID
 AsanReportOutline (
   UINTN  addr,
@@ -1042,6 +1144,7 @@ AsanEmitReport (
 VOID
 AsanReportFirmwareClass (
   IN CONST CHAR8  *BugDescr,
+  IN CONST CHAR8  *Detail,
   IN UINTN        Addr,
   IN UINTN        Size,
   IN UINTN        IsWrite,
@@ -1053,21 +1156,51 @@ AsanReportFirmwareClass (
   CONST CHAR8  *Cursor;
   CHAR8        Class[48];
 
+  mFwsanDetected++;
+
+  //
+  // Every return below is counted, and the counts are narrated by AsanFwsanNote. A silent
+  // return here is what made 6.4 million double-fetch detections produce zero reports on
+  // EVAL-1 run 42186976238 with nothing in the capture to say which guard had closed.
+  //
   if (!asan_inited || asan_is_deactivated) {
+    mFwsanSuppressedOff++;
+    AsanFwsanNote ("off", mFwsanSuppressedOff);
     return;
   }
 
-  for (Index = 0; Index < mOutlineSeenCount; Index++) {
-    if (mOutlineSeenIp[Index] == Ip) {
+  //
+  // The fwsan table, not the outline one. See the declaration: sharing it let generic
+  // reports consume the budget these classes need, and this family touches many more
+  // distinct IPs because the reporting site is whichever library did the read.
+  //
+  for (Index = 0; Index < mFwsanSeenCount; Index++) {
+    if (mFwsanSeenIp[Index] == Ip) {
+      mFwsanSuppressedSeen++;
+      AsanFwsanNote ("already-seen", mFwsanSuppressedSeen);
       return;
     }
   }
 
-  if (mOutlineSeenCount >= ASAN_OUTLINE_IP_SEEN) {
+  if (mFwsanSeenCount >= ASAN_FWSAN_IP_SEEN) {
+    mFwsanSuppressedFull++;
+    AsanFwsanNote ("table-full", mFwsanSuppressedFull);
     return;
   }
 
-  mOutlineSeenIp[mOutlineSeenCount++] = Ip;
+  mFwsanSeenIp[mFwsanSeenCount++] = Ip;
+  mFwsanReported++;
+
+  //
+  // The class banner, emitted here and nowhere else so that it cannot outlive the report
+  // it introduces. Kept in the "FWSAN: <class> -- <detail>" shape because bench_cases.py
+  // scores a detection on exactly that separator.
+  //
+  SerialOutput ("FWSAN: ");
+  SerialOutput (BugDescr);
+  SerialOutput (" -- ");
+  SerialOutput ((Detail != NULL) ? Detail : "no detail");
+  SerialOutput ("\n");
 
   //
   // The "fwsan-" prefix is applied here rather than by each caller, so every class that
