@@ -643,6 +643,180 @@ def git_bytes(repo, *args):
 PORT_BASE = '1eeca0750af5af2f0e78437bf791ac2de74bde74'
 
 
+def resolve_conflicts(dst, conflicted):
+    """Resolve what is safely resolvable among the conflicted paths, refuse the rest.
+
+    Returns (resolved, unresolved). A path left in `unresolved` keeps its conflict
+    markers, so a human can see what the port and upstream each wanted.
+
+    Extracted from main() so it can be called directly. This is the unit that quietly
+    corrupted MdeModulePkg/Core/PiSmmCore/PiSmmCore.c on run 42185742692, and a
+    resolver nobody can call is a resolver nobody can falsify.
+    """
+    # What the port legitimately changes in tools_def is the CLANGSAN toolchain. Its other
+    # edits there are fork drift, and forcing them onto a newer edk2 breaks the build a long
+    # way from the cause: the 2023 delta redefines GCC_IA32_X64_DLINK_COMMON in terms of
+    # GCC_DLINK_FLAGS_COMMON, which upstream has since renamed, so the generated Conf ends
+    # at "Macro or Environment has not been defined" naming a line in a file nobody wrote.
+    def port_owns(line, path):
+        if not path.endswith('tools_def.template'):
+            return True
+        body = line.strip()
+        if not body or body.startswith('#'):
+            return True
+        return 'CLANGSAN' in body or 'SAN_FLAGS' in body
+
+    resolved, unresolved = [], []
+    for path in conflicted:
+        full = os.path.join(dst, path)
+        try:
+            # newline='' or Python's universal newlines turn every CRLF into LF on the
+            # way in and write LF on the way out. edk2 is CRLF throughout, so resolving
+            # one conflict rewrote the whole file's line endings, and the port's actual
+            # change was then invisible in a diff of 566 rewritten lines.
+            body = open(full, newline='', errors='ignore').read()
+        except OSError:
+            unresolved.append(path)
+            continue
+        if '<<<<<<< ' not in body:
+            resolved.append(path)                       # git resolved it after all
+            continue
+        if path.endswith(('.template', '.h', '.inf', '.dec')):
+            # These are additive declaration lists. tools_def and build_rule take the last
+            # definition of a macro, and a header, INF or DEC gains a declaration without
+            # losing one, so keeping both sides with ours last is the merge rather than a
+            # compromise. Deliberately NOT the linker script, whose sections have braces --
+            # keeping both sides there put the init_array block outside its section and the
+            # link failed with "syntax error" -- nor a DSC or FDF, where a conflict spanning
+            # the tail of the file duplicates the entire platform definition.
+            merged, keep = [], None
+            for line in body.split('\n'):
+                if line.startswith('<<<<<<< '):
+                    keep = ('ours', [], [])
+                elif line.startswith('=======') and keep:
+                    keep = ('theirs', keep[1], [])
+                elif line.startswith('>>>>>>> ') and keep:
+                    merged.extend(keep[1])
+                    merged.extend(l for l in keep[2] if port_owns(l, path))
+                    keep = None
+                elif keep:
+                    (keep[1] if keep[0] == 'ours' else keep[2]).append(line)
+                else:
+                    merged.append(line)
+            open(full, 'w', newline='').write('\n'.join(merged))
+            resolved.append(path)
+        elif path.endswith('.lds'):
+            # The conflict is always the same shape: the port adds the sanitizer's
+            # constructor and destructor arrays at the end of the section that collects
+            # AutoGen's GUIDs, so its side ends with that section's closing brace, while
+            # upstream's side is only the closing brace -- "} :text" once upstream started
+            # assigning the section to a program header.
+            #
+            # Both sides therefore end the same section and neither is a superset. The
+            # merge is the port's statements followed by upstream's closer: taking both
+            # verbatim leaves the arrays after the brace, outside any section, and the
+            # link stops at "GccBase.lds:51: syntax error" -- which names the linker
+            # script rather than the merge that wrote it.
+            def closes(line):
+                return line.strip().startswith('}')
+
+            merged, ours, theirs, keep, safe = [], [], [], None, True
+
+            def flush_lds():
+                nonlocal safe
+                if not all(closes(l) or not l.strip() for l in ours):
+                    safe = False                        # a shape we have not seen
+                    return
+                body_lines = list(theirs)
+                while body_lines and (closes(body_lines[-1])
+                                      or not body_lines[-1].strip()):
+                    body_lines.pop()
+                merged.extend(body_lines)
+                merged.extend(ours)
+
+            for line in body.split('\n'):
+                if line.startswith('<<<<<<< '):
+                    keep, ours, theirs = 'ours', [], []
+                elif line.startswith('=======') and keep:
+                    keep = 'theirs'
+                elif line.startswith('>>>>>>> ') and keep:
+                    flush_lds()
+                    keep = None
+                elif keep == 'ours':
+                    ours.append(line)
+                elif keep == 'theirs':
+                    theirs.append(line)
+                else:
+                    merged.append(line)
+            if safe:
+                open(full, 'w', newline='').write('\n'.join(merged))
+                resolved.append(path)
+            else:
+                unresolved.append(path)
+        elif not path.endswith(('.dsc', '.dsc.inc', '.fdf', '.fdf.inc')):
+            # Everything below is a key-value merge for the platform description files,
+            # and it is the arm with no model of what it is editing -- so it has to be
+            # asked for by name rather than reached by falling through.
+            #
+            # It used to be the `else`, which meant a .c file went through it. key_of()
+            # keys a line on the text before its first '=', every C statement with an
+            # assignment in it therefore has a key, and flush() drops the port's lines
+            # whose key collides with upstream's. On PiSmmCore.c that deleted statements
+            # out of the middle of functions: run 42185742692 came back with
+            # "extraneous closing brace" at six places, 'break' outside any loop and
+            # mSmmCoreSmiHandlers undeclared, from a file that had merged cleanly until
+            # a port edit rewrote its line endings and left the merge with no anchor.
+            #
+            # A port that corrupts the firmware it is about to fuzz is worse than a port
+            # that stops: the build error named PiSmmCore.c and nothing named the merge.
+            # So refuse, by name, and let the port stage report it REMAINING.
+            unresolved.append(path)
+        else:
+            # Where both sides set the same thing, the port's value is the deliberate one:
+            # BaseCryptLibNull instead of the real instance because the openssl submodule
+            # is not built, MEMFD at 0x2700000 instead of 0xF80000 because instrumented
+            # code does not fit in the stock volume. Where they set different things, both
+            # belong -- upstream's new AmdSvsmLib line and the port's comment are not in
+            # competition. Keying on the text before the first | or = separates the two
+            # cases without knowing anything about DSC, FDF or C syntax.
+            merged, ours, theirs, keep = [], [], [], None
+            # An FDF region is "offset|size" followed by the PCD pair or FV it binds. The
+            # offset is a position, not a name, so keying on it makes upstream's
+            # 0x100000|0xE80000 and the port's 0x300000|0x2400000 look like two different
+            # settings and both are kept. The result is two offset lines above one PCD
+            # binding, which is not valid FDF: the build ends in a BaseTools traceback at
+            # "PCD gUefiOvmfPkgTokenSpaceGuid.PcdOvmfDxeMemFvBase is not defined in DSC
+            # file", naming neither the region nor the merge. When the port moves a region
+            # it means to move it, so its offset replaces upstream's.
+            def key_of(line):
+                body = line.split('#')[0].strip()
+                for sep in ('|', '='):
+                    if sep in body:
+                        return body.split(sep)[0].strip()
+                return None
+            def flush():
+                theirkeys = {key_of(l) for l in theirs if key_of(l)}
+                merged.extend(l for l in ours if key_of(l) not in theirkeys)
+                merged.extend(theirs)
+            for line in body.split('\n'):
+                if line.startswith('<<<<<<< '):
+                    keep, ours, theirs = 'ours', [], []
+                elif line.startswith('=======') and keep:
+                    keep = 'theirs'
+                elif line.startswith('>>>>>>> ') and keep:
+                    flush()
+                    keep = None
+                elif keep == 'ours':
+                    ours.append(line)
+                elif keep == 'theirs':
+                    theirs.append(line)
+                else:
+                    merged.append(line)
+            open(full, 'w', newline='').write('\n'.join(merged))
+            resolved.append(path)
+    return resolved, unresolved
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -868,156 +1042,13 @@ def main():
             why = (out.stderr or out.stdout).strip().splitlines()
             failed.append((path, why[0][:90] if why else 'no message'))
 
-    # A conflict leaves markers in the file. git apply --3way reports that as a non-zero
-    # exit the caller can shrug off, and the tree then looks ported: the build runs, reads
-    # "=======" in Conf/tools_def.txt, and stops at "Macro or Environment has not been
-    # defined" with no hint that a merge is the reason. Resolve what is safely resolvable
-    # and fail on the rest, because a half-ported tree that builds is worse than one that
-    # does not.
-    # What the port legitimately changes in tools_def is the CLANGSAN toolchain. Its other
-    # edits there are fork drift, and forcing them onto a newer edk2 breaks the build a long
-    # way from the cause: the 2023 delta redefines GCC_IA32_X64_DLINK_COMMON in terms of
-    # GCC_DLINK_FLAGS_COMMON, which upstream has since renamed, so the generated Conf ends
-    # at "Macro or Environment has not been defined" naming a line in a file nobody wrote.
-    def port_owns(line, path):
-        if not path.endswith('tools_def.template'):
-            return True
-        body = line.strip()
-        if not body or body.startswith('#'):
-            return True
-        return 'CLANGSAN' in body or 'SAN_FLAGS' in body
-
-    resolved, unresolved = [], []
-    for path in conflicted:
-        full = os.path.join(dst, path)
-        try:
-            # newline='' or Python's universal newlines turn every CRLF into LF on the
-            # way in and write LF on the way out. edk2 is CRLF throughout, so resolving
-            # one conflict rewrote the whole file's line endings, and the port's actual
-            # change was then invisible in a diff of 566 rewritten lines.
-            body = open(full, newline='', errors='ignore').read()
-        except OSError:
-            unresolved.append(path)
-            continue
-        if '<<<<<<< ' not in body:
-            resolved.append(path)                       # git resolved it after all
-            continue
-        if path.endswith(('.template', '.h', '.inf', '.dec')):
-            # These are additive declaration lists. tools_def and build_rule take the last
-            # definition of a macro, and a header, INF or DEC gains a declaration without
-            # losing one, so keeping both sides with ours last is the merge rather than a
-            # compromise. Deliberately NOT the linker script, whose sections have braces --
-            # keeping both sides there put the init_array block outside its section and the
-            # link failed with "syntax error" -- nor a DSC or FDF, where a conflict spanning
-            # the tail of the file duplicates the entire platform definition.
-            merged, keep = [], None
-            for line in body.split('\n'):
-                if line.startswith('<<<<<<< '):
-                    keep = ('ours', [], [])
-                elif line.startswith('=======') and keep:
-                    keep = ('theirs', keep[1], [])
-                elif line.startswith('>>>>>>> ') and keep:
-                    merged.extend(keep[1])
-                    merged.extend(l for l in keep[2] if port_owns(l, path))
-                    keep = None
-                elif keep:
-                    (keep[1] if keep[0] == 'ours' else keep[2]).append(line)
-                else:
-                    merged.append(line)
-            open(full, 'w', newline='').write('\n'.join(merged))
-            resolved.append(path)
-        elif path.endswith('.lds'):
-            # The conflict is always the same shape: the port adds the sanitizer's
-            # constructor and destructor arrays at the end of the section that collects
-            # AutoGen's GUIDs, so its side ends with that section's closing brace, while
-            # upstream's side is only the closing brace -- "} :text" once upstream started
-            # assigning the section to a program header.
-            #
-            # Both sides therefore end the same section and neither is a superset. The
-            # merge is the port's statements followed by upstream's closer: taking both
-            # verbatim leaves the arrays after the brace, outside any section, and the
-            # link stops at "GccBase.lds:51: syntax error" -- which names the linker
-            # script rather than the merge that wrote it.
-            def closes(line):
-                return line.strip().startswith('}')
-
-            merged, ours, theirs, keep, safe = [], [], [], None, True
-
-            def flush_lds():
-                nonlocal safe
-                if not all(closes(l) or not l.strip() for l in ours):
-                    safe = False                        # a shape we have not seen
-                    return
-                body_lines = list(theirs)
-                while body_lines and (closes(body_lines[-1])
-                                      or not body_lines[-1].strip()):
-                    body_lines.pop()
-                merged.extend(body_lines)
-                merged.extend(ours)
-
-            for line in body.split('\n'):
-                if line.startswith('<<<<<<< '):
-                    keep, ours, theirs = 'ours', [], []
-                elif line.startswith('=======') and keep:
-                    keep = 'theirs'
-                elif line.startswith('>>>>>>> ') and keep:
-                    flush_lds()
-                    keep = None
-                elif keep == 'ours':
-                    ours.append(line)
-                elif keep == 'theirs':
-                    theirs.append(line)
-                else:
-                    merged.append(line)
-            if safe:
-                open(full, 'w', newline='').write('\n'.join(merged))
-                resolved.append(path)
-            else:
-                unresolved.append(path)
-        else:
-            # Where both sides set the same thing, the port's value is the deliberate one:
-            # BaseCryptLibNull instead of the real instance because the openssl submodule
-            # is not built, MEMFD at 0x2700000 instead of 0xF80000 because instrumented
-            # code does not fit in the stock volume. Where they set different things, both
-            # belong -- upstream's new AmdSvsmLib line and the port's comment are not in
-            # competition. Keying on the text before the first | or = separates the two
-            # cases without knowing anything about DSC, FDF or C syntax.
-            merged, ours, theirs, keep = [], [], [], None
-            # An FDF region is "offset|size" followed by the PCD pair or FV it binds. The
-            # offset is a position, not a name, so keying on it makes upstream's
-            # 0x100000|0xE80000 and the port's 0x300000|0x2400000 look like two different
-            # settings and both are kept. The result is two offset lines above one PCD
-            # binding, which is not valid FDF: the build ends in a BaseTools traceback at
-            # "PCD gUefiOvmfPkgTokenSpaceGuid.PcdOvmfDxeMemFvBase is not defined in DSC
-            # file", naming neither the region nor the merge. When the port moves a region
-            # it means to move it, so its offset replaces upstream's.
-            def key_of(line):
-                body = line.split('#')[0].strip()
-                for sep in ('|', '='):
-                    if sep in body:
-                        return body.split(sep)[0].strip()
-                return None
-            def flush():
-                theirkeys = {key_of(l) for l in theirs if key_of(l)}
-                merged.extend(l for l in ours if key_of(l) not in theirkeys)
-                merged.extend(theirs)
-            for line in body.split('\n'):
-                if line.startswith('<<<<<<< '):
-                    keep, ours, theirs = 'ours', [], []
-                elif line.startswith('=======') and keep:
-                    keep = 'theirs'
-                elif line.startswith('>>>>>>> ') and keep:
-                    flush()
-                    keep = None
-                elif keep == 'ours':
-                    ours.append(line)
-                elif keep == 'theirs':
-                    theirs.append(line)
-                else:
-                    merged.append(line)
-            open(full, 'w', newline='').write('\n'.join(merged))
-            resolved.append(path)
-
+    # A conflict leaves markers in the file. git apply --3way reports that as a
+    # non-zero exit the caller can shrug off, and the tree then looks ported: the
+    # build runs, reads "=======" in Conf/tools_def.txt, and stops at "Macro or
+    # Environment has not been defined" with no hint that a merge is the reason.
+    # Resolve what is safely resolvable and fail on the rest, because a half-ported
+    # tree that builds is worse than one that does not.
+    resolved, unresolved = resolve_conflicts(dst, conflicted)
     # firness.py instruments a tree by applying uefi_asan/asan.patch unless the tree
     # carries this marker. That patch is from 2024 and installs the same CLANGSAN
     # toolchain this port has just merged properly: applied on top, it lands a second
