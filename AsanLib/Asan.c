@@ -1177,7 +1177,18 @@ AsanReportFirmwareClass (
   for (Index = 0; Index < mFwsanSeenCount; Index++) {
     if (mFwsanSeenIp[Index] == Ip) {
       mFwsanSuppressedSeen++;
-      AsanFwsanNote ("already-seen", mFwsanSuppressedSeen);
+      //
+      // Narrated only while nothing has been reported. Suppressing a repeat of an ip that
+      // has already been reported is this table working, and saying so costs a line per
+      // detection: measured on EVAL-1 run 42310220335, 991623 of them, because snapshot
+      // restore rewinds these counters with the rest of guest memory and the powers-of-two
+      // walk therefore restarts every iteration rather than climbing once. The case worth
+      // a line is the one that started this -- detections arriving and no report beside
+      // them -- and that is exactly mFwsanReported == 0.
+      //
+      if (mFwsanReported == 0) {
+        AsanFwsanNote ("already-seen", mFwsanSuppressedSeen);
+      }
       return;
     }
   }
