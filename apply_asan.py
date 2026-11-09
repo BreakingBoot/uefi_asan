@@ -643,6 +643,30 @@ def git_bytes(repo, *args):
 PORT_BASE = '1eeca0750af5af2f0e78437bf791ac2de74bde74'
 
 
+# Files whose port content is ONLY narration -- no instrumentation, no build wiring, no
+# behaviour. A conflict in one of these is dropped rather than refused, because the port
+# stage failing on it stops a campaign that would otherwise have run.
+#
+# This is not a softened standard. PiSmmCore.c's port content is 52 added lines, 35 of them
+# comments, nothing removed, and the only code is an EFI_GUID copy that exists to feed a
+# DEBUG. Keeping the port's side on a newer edk2 does not merely conflict -- it does not
+# COMPILE: upstream restructured SmmEntryPoint so that `CommunicateHeader` no longer exists
+# in that arm (it hands SmiManage a `CommGuid` local instead), and the port's line names it.
+# The port's own comment there predicted exactly this. So for these paths "drop" is the
+# only correct resolution available, not a compromise between two good ones.
+#
+# What it costs is real and has to be said out loud rather than discovered: without this
+# the guest prints no "SmmCore: dispatch <guid> len <n> -> <status>" line, so a campaign on
+# such a tree cannot report which handler it reached or how often. Findings still land --
+# a CPU fault and a sanitizer report need no narration -- but SMI reachability stops being
+# measurable.
+DIAGNOSTIC_ONLY = {
+    'MdeModulePkg/Core/PiSmmCore/PiSmmCore.c':
+        'SMI dispatch narration ("SmmCore: dispatch ..."). Dropping it leaves the '
+        'campaign able to find defects but unable to say which handler it reached',
+}
+
+
 def resolve_conflicts(dst, conflicted):
     """Resolve what is safely resolvable among the conflicted paths, refuse the rest.
 
@@ -666,7 +690,7 @@ def resolve_conflicts(dst, conflicted):
             return True
         return 'CLANGSAN' in body or 'SAN_FLAGS' in body
 
-    resolved, unresolved = [], []
+    resolved, unresolved, dropped = [], [], []
     for path in conflicted:
         full = os.path.join(dst, path)
         try:
@@ -753,6 +777,44 @@ def resolve_conflicts(dst, conflicted):
                 resolved.append(path)
             else:
                 unresolved.append(path)
+        elif path in DIAGNOSTIC_ONLY:
+            # The WHOLE file goes back to the destination's version, not just the
+            # conflicted hunks.
+            #
+            # A port diff for one file is several hunks, and they succeed independently:
+            # on edk2-stable202608 two of PiSmmCore.c's three conflicted and the third
+            # applied cleanly. Resolving only the conflicts therefore leaves a file
+            # carrying part of the narration -- and the parts are not independent. The
+            # surviving hunk there prints `IsOverlapped`, which that release still
+            # declares, so it happened to compile; the hunk beside it names
+            # `CommunicateHeader`, which that release deleted, and would not have. Which
+            # half survives is decided by upstream's churn, so a partial narration is
+            # both untrustworthy to read and a compile break waiting for the next
+            # release -- one that surfaces at the build stage, far from this merge.
+            #
+            # git restores it, because only git can undo the hunks that already applied;
+            # a line filter over the conflict markers cannot see them. HEAD is the
+            # pristine destination: apply_asan is handed a clean checkout of the ref
+            # being ported to.
+            back = git(dst, 'checkout', 'HEAD', '--', path)
+            if back.returncode:
+                # No git, or a path git does not know -- keep the destination's side of
+                # each conflict so that what is left at least has no markers in it.
+                # "ours" is the tree being patched; the .lds arm below relies on the same.
+                merged, keep = [], None
+                for line in body.split('\n'):
+                    if line.startswith('<<<<<<< '):
+                        keep = 'ours'
+                    elif line.startswith('=======') and keep:
+                        keep = 'theirs'
+                    elif line.startswith('>>>>>>> ') and keep:
+                        keep = None
+                    elif keep == 'theirs':
+                        continue
+                    else:
+                        merged.append(line)
+                open(full, 'w', newline='').write('\n'.join(merged))
+            dropped.append(path)
         elif not path.endswith(('.dsc', '.dsc.inc', '.fdf', '.fdf.inc')):
             # Everything below is a key-value merge for the platform description files,
             # and it is the arm with no model of what it is editing -- so it has to be
@@ -814,7 +876,7 @@ def resolve_conflicts(dst, conflicted):
                     merged.append(line)
             open(full, 'w', newline='').write('\n'.join(merged))
             resolved.append(path)
-    return resolved, unresolved
+    return resolved, unresolved, dropped
 
 
 def main():
@@ -1048,7 +1110,7 @@ def main():
     # Environment has not been defined" with no hint that a merge is the reason.
     # Resolve what is safely resolvable and fail on the rest, because a half-ported
     # tree that builds is worse than one that does not.
-    resolved, unresolved = resolve_conflicts(dst, conflicted)
+    resolved, unresolved, dropped = resolve_conflicts(dst, conflicted)
     # firness.py instruments a tree by applying uefi_asan/asan.patch unless the tree
     # carries this marker. That patch is from 2024 and installs the same CLANGSAN
     # toolchain this port has just merged properly: applied on top, it lands a second
@@ -1109,6 +1171,9 @@ def main():
 
     print(f'  merged cleanly     {len(clean)}')
     print(f'  conflicts resolved {len(resolved)}')
+    for path in dropped:
+        print(f'  NARRATION DROPPED {path}')
+        print(f'                    {DIAGNOSTIC_ONLY[path]}')
     print(f'  conflicts REMAINING {len(unresolved)}')
     for path in unresolved:
         print(f'      {path}')
