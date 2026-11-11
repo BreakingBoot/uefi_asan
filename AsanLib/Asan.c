@@ -272,6 +272,34 @@ STATIC BOOLEAN                mRegionChecksActive   = FALSE;
 void AsanSignalSolution (VOID);
 
 //
+// What a double fetch knows that the access on its own does not.
+//
+// The access says "2 bytes were read at 0x1B56802C by ReadUnaligned16", and
+// MdePkg/Library/BaseLib/Unaligned.c is a leaf utility called from everywhere -- nobody
+// can patch that. The detector already holds the facts that make the finding actionable
+// and was throwing all of them away:
+//
+//   Offset    Addr minus the base of the buffer the harness registered, which is the
+//             OFFSET OF THE FIELD inside the caller-controlled struct. Triage joins it
+//             to the handler's comm-buffer layout and gets a field name.
+//   Size      how far that buffer reaches, so a reader can tell a field from the tail.
+//   First*    the read that VALIDATED. Seen[] used to record only the granule, so the
+//             report named the second read and lost the first, and the first is the one
+//             whose check was bypassed.
+//
+// Passed by pointer and NULL for every other class, so the generic report path is
+// unchanged for the classes that have no untrusted buffer behind them.
+//
+typedef struct {
+  UINT64  Base;
+  UINT64  Size;
+  UINT64  Offset;
+  UINT64  FirstIp;
+  UINT64  FirstAddr;
+  UINT64  FirstSize;
+} ASAN_UNTRUSTED_FIELD;
+
+//
 // Forward declared for the same reason AsanSignalSolution above is: the firmware checks that
 // call these sit earlier in the file than the definitions, and under -Werror an implicit
 // declaration is an error, not a warning -- and because the implicit one is assumed
@@ -286,7 +314,25 @@ AsanEmitReport (
   IN UINTN        size,
   IN UINTN        is_write,
   IN UINTN        ip,
-  IN CONST CHAR8  *where
+  IN CONST CHAR8  *where,
+  IN CONST ASAN_UNTRUSTED_FIELD  *field       OPTIONAL
+  );
+
+//
+// The whole of the guard, dedup, banner and report path. AsanReportFirmwareClass below is
+// this with no field, and is the entry point every other firmware-specific check uses --
+// its signature is declared by hand in AsanHelper.c and FwSanDxe.c, so it does not move.
+//
+STATIC
+VOID
+AsanReportFirmwareClassField (
+  IN CONST CHAR8  *BugDescr,
+  IN CONST CHAR8  *Detail,
+  IN UINTN        Addr,
+  IN UINTN        Size,
+  IN UINTN        IsWrite,
+  IN UINTN        Ip,
+  IN CONST ASAN_UNTRUSTED_FIELD  *Field       OPTIONAL
   );
 
 VOID
@@ -348,25 +394,32 @@ AsanNoteUntrustedRead (
   IN UINTN  Ip
   )
 {
-  UINT32   Index;
-  UINT64   Word;
-  BOOLEAN  Inside;
+  UINT32                Index;
+  UINT32                Region;
+  UINT64                Word;
+  ASAN_UNTRUSTED_FIELD  Field;
 
   if ((mAsanInfo == NULL) || (mAsanInfo->AsanUntrustedCount == 0)) {
     return;
   }
 
-  Inside = FALSE;
+  //
+  // WHICH buffer, not just whether. The offset of the field is measured from this
+  // region's base, so the index has to survive the search -- it used to be a BOOLEAN and
+  // the loop variable was then reused by the dedup walk below, which is why this is a
+  // separate variable rather than the broken-out Index.
+  //
+  Region = mAsanInfo->AsanUntrustedCount;
   for (Index = 0; Index < mAsanInfo->AsanUntrustedCount; Index++) {
     if ((Addr >= mAsanInfo->AsanUntrustedBase[Index]) &&
         ((Addr + Size - 1) <= mAsanInfo->AsanUntrustedEnd[Index]))
     {
-      Inside = TRUE;
+      Region = Index;
       break;
     }
   }
 
-  if (!Inside) {
+  if (Region >= mAsanInfo->AsanUntrustedCount) {
     return;
   }
 
@@ -394,13 +447,34 @@ AsanNoteUntrustedRead (
       // silent and a detection that is narrated is always accompanied by its address,
       // size and ip.
       //
-      AsanReportFirmwareClass (
+      //
+      // The field, and both reads. Built here because this is already the branch that has
+      // decided to report: the fast path above is untouched, and a detection that the
+      // guards in AsanReportFirmwareClassField then swallow has paid six stores for it.
+      //
+      // Offset is from the REGISTERED base, which for an SMI harness is the start of the
+      // EFI_SMM_COMMUNICATE_HEADER rather than of the handler's parameter block -- the
+      // harness registers CommBuffer and CommSize. AsanLib cannot know the layout above
+      // it and does not guess: it reports the offset it can prove, and
+      // scripts/bug_report.py subtracts the header and joins the remainder to the
+      // handler's struct.
+      //
+      Field.Base      = mAsanInfo->AsanUntrustedBase[Region];
+      Field.Size      = (mAsanInfo->AsanUntrustedEnd[Region] -
+                         mAsanInfo->AsanUntrustedBase[Region]) + 1;
+      Field.Offset    = (UINT64)Addr - mAsanInfo->AsanUntrustedBase[Region];
+      Field.FirstIp   = mAsanInfo->AsanUntrustedSeenIp[Index];
+      Field.FirstAddr = mAsanInfo->AsanUntrustedSeenAddr[Index];
+      Field.FirstSize = (UINT64)mAsanInfo->AsanUntrustedSeenSize[Index];
+
+      AsanReportFirmwareClassField (
         "double-fetch",
         "untrusted word read twice in one call",
         Addr,
         Size,
         0,
-        Ip
+        Ip,
+        &Field
         );
       //
       // Reported, but NOT escalated to a fuzzer solution unless asked for.
@@ -432,7 +506,15 @@ AsanNoteUntrustedRead (
   }
 
   if (mAsanInfo->AsanUntrustedSeenCount < 8) {
-    mAsanInfo->AsanUntrustedSeen[mAsanInfo->AsanUntrustedSeenCount] = Word;
+    //
+    // The granule is what the match is made on; the ip, the address and the size are what
+    // the report needs in order to name this read as well as the one that comes back to
+    // the same word. Recorded together so they cannot describe different fetches.
+    //
+    mAsanInfo->AsanUntrustedSeen[mAsanInfo->AsanUntrustedSeenCount]     = Word;
+    mAsanInfo->AsanUntrustedSeenIp[mAsanInfo->AsanUntrustedSeenCount]   = (UINT64)Ip;
+    mAsanInfo->AsanUntrustedSeenAddr[mAsanInfo->AsanUntrustedSeenCount] = (UINT64)Addr;
+    mAsanInfo->AsanUntrustedSeenSize[mAsanInfo->AsanUntrustedSeenCount] = (UINT32)Size;
     mAsanInfo->AsanUntrustedSeenCount++;
   }
 }
@@ -1047,7 +1129,7 @@ AsanReportOutline (
   }
 
   AsanEmitReport (bug_descr, addr, size, is_write, ip,
-                  "asan-outline-instrumentation");
+                  "asan-outline-instrumentation", NULL);
   SerialOutput ("[ASan] shadow ");
   Num2Str64bit (sp, NumStr);
   SerialOutput (NumStr);
@@ -1100,6 +1182,18 @@ AsanLastByteBad (
 // File is a marker rather than a path because an outline handler has no source position;
 // the ip is what triage attributes a module from, and bug_report.py groups by it.
 //
+// The untrusted field goes on the ERROR line and nowhere else, on purpose. firness.py
+// takes the whole tail of that line as the row's Message -- it reads it off prev_line
+// when it sees the bug_descr= that follows -- so anything appended here reaches
+// crashes.csv with no change to the extractor, and anything put on a line of its own
+// between the two would break the pair that makes the row.
+//
+// key=0xVALUE with no space after the '=', also on purpose. bug_report.py and firness.py
+// both pull the access apart with `ip (0x..)`, `size (0x..)` and `address (0x..)`, which
+// are leftmost-first searches: a field spelled "first_ip 0x.." is a second thing those
+// patterns can match, and relying on the real one appearing earlier in the line is a
+// coincidence, not a design. The '=' makes a collision impossible.
+//
 STATIC
 VOID
 AsanEmitReport (
@@ -1108,7 +1202,8 @@ AsanEmitReport (
   IN UINTN        size,
   IN UINTN        is_write,
   IN UINTN        ip,
-  IN CONST CHAR8  *where
+  IN CONST CHAR8  *where,
+  IN CONST ASAN_UNTRUSTED_FIELD  *field       OPTIONAL
   )
 {
   CHAR8  NumStr[19];
@@ -1126,6 +1221,27 @@ AsanEmitReport (
   SerialOutput (", ip ");
   Num2Str64bit (ip, NumStr);
   SerialOutput (NumStr);
+  if (field != NULL) {
+    SerialOutput (", untrusted_field offset=");
+    Num2Str64bit (field->Offset, NumStr);
+    SerialOutput (NumStr);
+    SerialOutput (" base=");
+    Num2Str64bit (field->Base, NumStr);
+    SerialOutput (NumStr);
+    SerialOutput (" extent=");
+    Num2Str64bit (field->Size, NumStr);
+    SerialOutput (NumStr);
+    SerialOutput (" first_ip=");
+    Num2Str64bit (field->FirstIp, NumStr);
+    SerialOutput (NumStr);
+    SerialOutput (" first_addr=");
+    Num2Str64bit (field->FirstAddr, NumStr);
+    SerialOutput (NumStr);
+    SerialOutput (" first_bytes=");
+    Num2Str64bit (field->FirstSize, NumStr);
+    SerialOutput (NumStr);
+  }
+
   SerialOutput ("\n");
   SerialOutput ("bug_descr=");
   SerialOutput (bug_descr);
@@ -1141,14 +1257,22 @@ AsanEmitReport (
 // What a firmware-specific check calls once it has decided. Deduped by return IP for the
 // same reason the outline handlers are: a single site can carry tens of thousands of hits.
 //
+// Keyed on the Ip alone, deliberately unchanged. The alternative -- keying on the ip and
+// the field together -- would report every field a leaf utility re-reads instead of the
+// first, and it costs a second 256-entry table in a static library that is linked into
+// 265 instrumented modules. So the field in the report is the first one re-read at that
+// site, which is what the hit count was already counting.
+//
+STATIC
 VOID
-AsanReportFirmwareClass (
+AsanReportFirmwareClassField (
   IN CONST CHAR8  *BugDescr,
   IN CONST CHAR8  *Detail,
   IN UINTN        Addr,
   IN UINTN        Size,
   IN UINTN        IsWrite,
-  IN UINTN        Ip
+  IN UINTN        Ip,
+  IN CONST ASAN_UNTRUSTED_FIELD  *Field       OPTIONAL
   )
 {
   UINTN        Index;
@@ -1229,7 +1353,26 @@ AsanReportFirmwareClass (
   }
 
   Class[Length] = '\0';
-  AsanEmitReport (Class, Addr, Size, IsWrite, Ip, "fwsan");
+  AsanEmitReport (Class, Addr, Size, IsWrite, Ip, "fwsan", Field);
+}
+
+//
+// The six-argument entry point, for a check with no untrusted buffer behind it. A wrapper
+// rather than a second body: the guards, the counters and the banner above are the ones
+// that stopped 6.4 million detections from being announced without being reported, and a
+// class that went round them would put that back one caller at a time.
+//
+VOID
+AsanReportFirmwareClass (
+  IN CONST CHAR8  *BugDescr,
+  IN CONST CHAR8  *Detail,
+  IN UINTN        Addr,
+  IN UINTN        Size,
+  IN UINTN        IsWrite,
+  IN UINTN        Ip
+  )
+{
+  AsanReportFirmwareClassField (BugDescr, Detail, Addr, Size, IsWrite, Ip, NULL);
 }
 
 #define DEFINE_ASAN_LOAD(size)                      \

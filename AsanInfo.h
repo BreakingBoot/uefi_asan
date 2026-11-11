@@ -70,6 +70,26 @@ typedef struct {
   UINT64       AsanUntrustedBase[4];
   UINT64       AsanUntrustedEnd[4];
   UINT64       AsanUntrustedSeen[8];
+  //
+  // What the FIRST read of each of those words was. Seen[] alone records that the word
+  // has been read, which names the SECOND fetch and loses the first -- and the first is
+  // the read that validated. A developer handed only the re-read gets the line that used
+  // the value and nothing pointing at the check it got past, which is the half of a
+  // double fetch that has to be fixed.
+  //
+  // Parallel arrays rather than an array of structs, because the HOB is read through one
+  // pointer by every instrumented module and everything above is laid out this way
+  // already. The same fixed eight, and for the same reason: the snapshot restore rewinds
+  // all of this with the rest of guest memory, so it is per-call state and a ninth entry
+  // would never be read.
+  //
+  // Addr as well as Ip, because the two reads need not be the same access: the match is
+  // by granule, so a 4-byte read of a length followed by an 8-byte read of the same word
+  // is the case this check exists for, and the sizes are what say that is what happened.
+  //
+  UINT64       AsanUntrustedSeenIp[8];
+  UINT64       AsanUntrustedSeenAddr[8];
+  UINT32       AsanUntrustedSeenSize[8];
 } ASAN_INFO;
 
 extern EFI_GUID gAsanInfoGuid;
