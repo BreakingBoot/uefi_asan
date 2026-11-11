@@ -667,6 +667,93 @@ DIAGNOSTIC_ONLY = {
 }
 
 
+# Files the port edits ONLY so that a platform description it does not fuzz still
+# compiles. PiSmmCore.inf lists AsanLib in [LibraryClasses], which makes the class a hard
+# requirement of the SMM core on every platform, so a DSC that builds PiSmmCore and
+# resolves nothing for it stops at "instance of library class [AsanLib] is not found".
+# The port answers that in each such DSC with AsanLibNull -- a no-op instance -- purely so
+# the port does not break trees nobody here builds.
+#
+# When upstream DELETES one of these files, the hunk has nowhere to go. That is not a
+# conflict: `git apply --3way` says "does not exist in index", which lands in `failed`,
+# and the port stage fails with a message naming a platform the pipeline never builds.
+# Measured: upstream deleted OvmfPkg/OvmfPkgIa32.dsc at edk2-stable202511, and the port
+# stage therefore fails on edk2-stable202511, 202602, 202605, 202608 and master -- every
+# ref the gates run on -- while 202302 through 202508.01 are untouched.
+#
+# Skipping is the only correct resolution available, and it is narrow in both directions:
+#
+#   * it applies ONLY when the destination does not have the file. A platform that exists
+#     is merged exactly as before, so no ref that works today changes behaviour.
+#   * it applies ONLY when the port's whole delta for that path is comments and library
+#     resolutions naming a *Null* instance -- see courtesy_delta(). A hunk that grows real
+#     content stops qualifying and fails the old way. The declaration below cannot
+#     therefore become a licence to drop instrumentation: the mechanism re-derives that
+#     from the port itself on every run rather than trusting this list.
+#
+# Nothing is lost by skipping: the platform the resolution exists for is not in the tree,
+# so there is no build left to keep working. Reviving the file instead -- what REVIVE does
+# for ClangBase.lds -- would be wrong here: it would reinstate a platform upstream
+# deliberately removed, at the fork's 2023 vintage, referencing libraries that release has
+# also deleted.
+PLATFORM_COURTESY = {
+    'OvmfPkg/OvmfPkgIa32.dsc':
+        'an AsanLibNull resolution that keeps the IA32 OVMF platform building. This '
+        'pipeline builds OvmfPkg/OvmfPkgX64.dsc, and upstream deleted this file at '
+        'edk2-stable202511',
+    'OvmfPkg/OvmfPkgIa32X64.dsc':
+        'an AsanLibNull resolution that keeps the IA32/X64 OVMF platform building. This '
+        'pipeline builds OvmfPkg/OvmfPkgX64.dsc',
+    'OvmfPkg/CloudHv/CloudHvX64.dsc':
+        'an AsanLibNull resolution that keeps the Cloud Hypervisor platform building. '
+        'This pipeline builds OvmfPkg/OvmfPkgX64.dsc',
+    'UefiPayloadPkg/UefiPayloadPkg.dsc':
+        'an AsanLibNull resolution that keeps the UefiPayload platform building. This '
+        'pipeline builds OvmfPkg/OvmfPkgX64.dsc',
+}
+
+# A library resolution: "Class|Path/To/Instance.inf".
+RESOLUTION = re.compile(r'^([A-Za-z_]\w*)\s*\|\s*(\S+\.inf)$')
+
+
+def courtesy_delta(src, base, path):
+    """Is the port's whole delta for `path` incapable of carrying instrumentation?
+
+    True only when every line the port ADDS is blank, a comment, or a library resolution
+    naming a *Null* instance, and the port REMOVES nothing. That is the shape of a
+    buildability courtesy and the shape of nothing else: an instrumented resolution names
+    the real instance (MdeModulePkg.dsc gets AsanLib|.../AsanLib.inf, and would be
+    refused here), a PCD or a module addition is not a resolution at all, and a deletion
+    means the port is changing what the platform does rather than answering a class it
+    left unresolved.
+
+    Asked of the port on every run, so PLATFORM_COURTESY is a statement about intent that
+    the code re-checks rather than a list that is trusted. A port edit that grows teeth
+    stops qualifying the moment it does, not the next time somebody reads the list.
+    """
+    diff = git_bytes(src, 'diff', f'{base}..HEAD', '--', path).stdout.decode(
+        'utf-8', 'replace')
+    added = []
+    for line in diff.split('\n'):
+        if line.startswith(('+++', '---', 'diff --git ', 'index ', '@@')):
+            continue
+        if line.startswith('-') and line[1:].strip():
+            return False                        # the port takes something away
+        if line.startswith('+'):
+            added.append(line[1:])
+    if not added:
+        return False                            # nothing to skip; let it merge
+    for line in added:
+        body = line.strip()
+        if not body or body.startswith('#'):
+            continue
+        found = RESOLUTION.match(body)
+        if found and 'Null' in os.path.basename(found.group(2)):
+            continue
+        return False
+    return True
+
+
 def resolve_conflicts(dst, conflicted):
     """Resolve what is safely resolvable among the conflicted paths, refuse the rest.
 
@@ -987,6 +1074,30 @@ def main():
     if revived:
         print(f'  revived {len(revived)} file(s) upstream deleted: {", ".join(revived)}')
 
+    # Platforms this tree no longer has. See PLATFORM_COURTESY: the port's delta for these
+    # is a no-op library resolution that keeps a platform the pipeline does not build
+    # compilable, so when upstream has deleted the platform there is nothing left to keep
+    # working -- while `git apply` against a file that is not in the index lands in
+    # `failed` and takes the whole port stage with it.
+    #
+    # After REVIVE, which is the other answer to a deleted file and the one to prefer when
+    # something still needs it. The two lists are disjoint by construction: a path is
+    # either carried across whole or skipped.
+    absent = []
+    for path in modified:
+        if path not in PLATFORM_COURTESY:
+            continue
+        if git(dst, 'ls-files', '--error-unmatch', '--', path).returncode == 0:
+            continue                    # this tree HAS the platform: merge as usual
+        # Re-derived from the port, not taken on trust. A delta that could carry
+        # instrumentation is not skipped, so it fails where it always did.
+        if not courtesy_delta(src, base, path):
+            print(f'  {path} is missing from this tree and its port delta is no longer '
+                  f'only a Null resolution, so it is NOT being skipped')
+            continue
+        absent.append(path)
+    modified = [f for f in modified if f not in absent]
+
     # tools_def is appended to, not diffed. The port's delta there both adds the CLANGSAN
     # toolchain and rewrites unrelated GCC macros the fork had renamed; applying the second
     # half to a newer edk2 deletes definitions that version still references, and the build
@@ -1174,12 +1285,29 @@ def main():
     for path in dropped:
         print(f'  NARRATION DROPPED {path}')
         print(f'                    {DIAGNOSTIC_ONLY[path]}')
+    print(f'  platforms absent   {len(absent)}')
+    for path in absent:
+        print(f'  PLATFORM ABSENT   {path}')
+        print(f'                    {PLATFORM_COURTESY[path]}')
     print(f'  conflicts REMAINING {len(unresolved)}')
     for path in unresolved:
         print(f'      {path}')
     print(f'  could not apply    {len(failed)}')
     for path, why in failed:
         print(f'      {path}: {why}')
+        # The message git gives for a file the destination deleted says nothing about a
+        # deletion, and the reader has no reason to connect it to the port. Name both the
+        # cause and the two answers, because this exact message cost run 42445269504 its
+        # whole budget at 57 seconds with nothing in the log that explained it.
+        if 'does not exist in index' in why:
+            print(f'        this tree does not have that file -- upstream deleted it, or '
+                  f'it postdates this')
+            print(f'        release -- and the port still carries a delta for it. Either '
+                  f'REVIVE it, when')
+            print(f'        something here needs the file, or declare it in '
+                  f'PLATFORM_COURTESY, when its')
+            print(f'        delta only keeps a platform this pipeline does not build '
+                  f'compilable.')
     print('  applied is not instrumented: build and count __asan_load/__asan_store')
     return 1 if (failed or unresolved) else 0
 
