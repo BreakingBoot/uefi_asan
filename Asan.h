@@ -165,6 +165,51 @@ AsanProtectedRegionName (
   IN UINT64  Size
   );
 
+//
+// Report a firmware-specific bug class -- one the compiler's own instrumentation cannot
+// see, such as a double fetch or a use of a boot service after ExitBootServices. Goes
+// through the same guards, counters and banner as a shadow finding, so a class that is
+// suppressed stays quiet instead of announcing a detection whose report never arrives.
+//
+// DECLARED HERE, which it was not. Every caller wrote its own prototype and nothing made
+// them agree: FwSanDxe's left `Detail` out, so for every FWSAN finding the address
+// arrived where a CONST CHAR8 * was expected and the banner walked it as a string, Addr
+// and Size arrived as 0, IsWrite got the return address, and Ip -- the dedup key and the
+// ip in the crashes.csv row -- was never passed at all. It survived because a byte near
+// the destination happened to be zero. With the declaration here the DEFINITION in
+// AsanLib is checked against it, so the next disagreement is a compile error.
+//
+// The weak definitions in MdePkg's AsanMemoryLib and AsanMemoryLibRepStr cannot include
+// this header -- MdePkg must not depend on MdeModulePkg, and an undefined weak leaves a
+// relocation GenFw rejects, so they have to DEFINE rather than declare. Those two stay
+// compared against this signature by scripts/fwsan_report_check.py instead.
+//
+VOID
+AsanReportFirmwareClass (
+  IN CONST CHAR8  *BugDescr,
+  IN CONST CHAR8  *Detail,
+  IN UINTN        Addr,
+  IN UINTN        Size,
+  IN UINTN        IsWrite,
+  IN UINTN        Ip
+  );
+
+//
+// Escalate the finding just reported into an objective the fuzzer sees. Separate from
+// the report so a class can be announced on a plain boot and escalated only inside the
+// fuzzing window.
+//
+// Declared here for the same reason as the call above. It is hand-written in eight
+// places across this tree in two spellings -- `void` and `VOID` -- which happen to be
+// the same type, so that set has never bitten; a no-argument function is the one shape
+// drift cannot hurt. The declaration is here so a caller that includes this header does
+// not have to add one more.
+//
+VOID
+AsanSignalSolution (
+  VOID
+  );
+
 extern UINTN __asan_shadow_memory_dynamic_address;
 extern int __asan_option_detect_stack_use_after_return;
 extern UINT64 mAsanShadowMemoryStart;
